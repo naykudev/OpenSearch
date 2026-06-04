@@ -43,6 +43,7 @@ import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry.Entry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.index.SegmentReplicationPressureService;
+import org.opensearch.index.mapper.DynamicArrayFieldTypeInferencer;
 import org.opensearch.index.mapper.BinaryFieldMapper;
 import org.opensearch.index.mapper.BooleanFieldMapper;
 import org.opensearch.index.mapper.CompletionFieldMapper;
@@ -114,9 +115,18 @@ public class IndicesModule extends AbstractModule {
         this.mapperRegistry = new MapperRegistry(
             getMappers(mapperPlugins),
             getMetadataMappers(mapperPlugins),
-            getFieldFilter(mapperPlugins)
+            getFieldFilter(mapperPlugins),
+            getDynamicArrayFieldTypeInferencers(mapperPlugins)
         );
         registerBuiltinWritables();
+    }
+
+    private static List<DynamicArrayFieldTypeInferencer> getDynamicArrayFieldTypeInferencers(List<MapperPlugin> mapperPlugins) {
+        List<DynamicArrayFieldTypeInferencer> inferencers = new ArrayList<>();
+        for (MapperPlugin mapperPlugin : mapperPlugins) {
+            inferencers.addAll(mapperPlugin.getDynamicArrayFieldTypeInferencers());
+        }
+        return inferencers;
     }
 
     private void registerBuiltinWritables() {

@@ -1109,6 +1109,9 @@ final class DocumentParser {
                                     context.parser().skipChildren();
                                     break;
                                 }
+                                if (tryDynamicArrayTypeInference(context, parentMapper, arrayFieldName)) {
+                                    break;
+                                }
                                 parseNonDynamicArray(context, parentMapper, lastFieldName, arrayFieldName);
                             } else {
                                 Mapper.BuilderContext builderContext = new Mapper.BuilderContext(
@@ -1143,6 +1146,110 @@ final class DocumentParser {
 
     private static boolean parsesArrayValue(Mapper mapper) {
         return mapper instanceof FieldMapper fieldMapper && fieldMapper.parsesArrayValue();
+    }
+
+    private static boolean tryDynamicArrayTypeInference(ParseContext context, ObjectMapper parentMapper, String arrayFieldName)
+        throws IOException {
+        List<DynamicArrayFieldTypeInferencer> inferencers = context.mapperService().getDynamicArrayFieldTypeInferencers();
+        if (inferencers.isEmpty()) {
+            return false;
+        }
+
+        XContentParser parser = context.parser();
+
+        // Buffer the array (parser is at START_ARRAY)
+        byte[] arrayBytes;
+        try (XContentBuilder bufferBuilder = XContentBuilder.builder(parser.contentType().xContent())) {
+            bufferBuilder.copyCurrentStructure(parser);
+            arrayBytes = BytesReference.toBytes(BytesReference.bytes(bufferBuilder));
+        }
+
+        // Inspect: count elements and detect first element token type
+        int arrayLength = 0;
+        XContentParser.Token firstElementToken = null;
+        try (
+            XContentParser inspectParser = parser.contentType()
+                .xContent()
+                .createParser(parser.getXContentRegistry(), parser.getDeprecationHandler(), arrayBytes)
+        ) {
+            XContentParser.Token token = inspectParser.nextToken(); // START_ARRAY
+            while ((token = inspectParser.nextToken()) != XContentParser.Token.END_ARRAY) {
+                if (token == null) break;
+                arrayLength++;
+                if (firstElementToken == null) {
+                    firstElementToken = token;
+                }
+                if (token == XContentParser.Token.START_OBJECT || token == XContentParser.Token.START_ARRAY) {
+                    inspectParser.skipChildren();
+                }
+            }
+        }
+
+        if (arrayLength == 0 || firstElementToken == null) {
+            replayBufferedArray(context, parentMapper, arrayFieldName, arrayBytes);
+            return true;
+        }
+
+        // Consult inferencers
+        boolean isNumericArray = firstElementToken == XContentParser.Token.VALUE_NUMBER;
+        String inferredType = null;
+        DynamicArrayFieldTypeInferencer winningInferencer = null;
+        for (DynamicArrayFieldTypeInferencer inferencer : inferencers) {
+            inferredType = inferencer.inferType(arrayFieldName, arrayLength, isNumericArray, context.indexSettings());
+            if (inferredType != null) {
+                winningInferencer = inferencer;
+                break;
+            }
+        }
+
+        if (inferredType == null) {
+            replayBufferedArray(context, parentMapper, arrayFieldName, arrayBytes);
+            return true;
+        }
+
+        // Build the mapper from the inferred type
+        Mapper.TypeParser.ParserContext parserContext = context.docMapperParser().parserContext();
+        Mapper.TypeParser typeParser = parserContext.typeParser(inferredType);
+        if (typeParser == null) {
+            replayBufferedArray(context, parentMapper, arrayFieldName, arrayBytes);
+            return true;
+        }
+
+        Map<String, Object> fieldConfig = winningInferencer.getFieldConfiguration(arrayFieldName, arrayLength);
+        Mapper.Builder<?> mapperBuilder = typeParser.parse(arrayFieldName, fieldConfig, parserContext);
+        Mapper.BuilderContext builderContext = new Mapper.BuilderContext(context.indexSettings().getSettings(), context.path());
+        Mapper mapper = mapperBuilder.build(builderContext);
+        context.addDynamicMapper(mapper);
+
+        // Parse the buffered array with the new mapper
+        try (
+            XContentParser replayParser = parser.contentType()
+                .xContent()
+                .createParser(parser.getXContentRegistry(), parser.getDeprecationHandler(), arrayBytes)
+        ) {
+            replayParser.nextToken(); // position at START_ARRAY
+            ParseContext replayContext = context.switchParser(replayParser);
+            context.path().add(arrayFieldName);
+            parseObjectOrField(replayContext, mapper);
+            context.path().remove();
+        }
+
+        return true;
+    }
+
+    private static void replayBufferedArray(ParseContext context, ObjectMapper parentMapper, String arrayFieldName, byte[] arrayBytes)
+        throws IOException {
+        XContentParser originalParser = context.parser();
+        try (
+            XContentParser replayParser = originalParser.contentType()
+                .xContent()
+                .createParser(originalParser.getXContentRegistry(), originalParser.getDeprecationHandler(), arrayBytes)
+        ) {
+            replayParser.nextToken(); // position at START_ARRAY
+            ParseContext replayContext = context.switchParser(replayParser);
+            final String[] replayPaths = splitAndValidatePath(arrayFieldName);
+            parseNonDynamicArray(replayContext, parentMapper, arrayFieldName, arrayFieldName);
+        }
     }
 
     private static void parseNonDynamicArray(ParseContext context, ObjectMapper mapper, final String lastFieldName, String arrayFieldName)

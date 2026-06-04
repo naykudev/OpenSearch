@@ -33,12 +33,15 @@
 package org.opensearch.indices.mapper;
 
 import org.opensearch.common.annotation.PublicApi;
+import org.opensearch.index.mapper.DynamicArrayFieldTypeInferencer;
 import org.opensearch.index.mapper.Mapper;
 import org.opensearch.index.mapper.MetadataFieldMapper;
 import org.opensearch.plugins.MapperPlugin;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
 import java.util.function.Predicate;
@@ -54,15 +57,26 @@ public final class MapperRegistry {
     private final Map<String, Mapper.TypeParser> mapperParsers;
     private final Map<String, MetadataFieldMapper.TypeParser> metadataMapperParsers;
     private final Function<String, Predicate<String>> fieldFilter;
+    private final List<DynamicArrayFieldTypeInferencer> dynamicArrayFieldTypeInferencers;
 
     public MapperRegistry(
         Map<String, Mapper.TypeParser> mapperParsers,
         Map<String, MetadataFieldMapper.TypeParser> metadataMapperParsers,
         Function<String, Predicate<String>> fieldFilter
     ) {
+        this(mapperParsers, metadataMapperParsers, fieldFilter, Collections.emptyList());
+    }
+
+    public MapperRegistry(
+        Map<String, Mapper.TypeParser> mapperParsers,
+        Map<String, MetadataFieldMapper.TypeParser> metadataMapperParsers,
+        Function<String, Predicate<String>> fieldFilter,
+        List<DynamicArrayFieldTypeInferencer> dynamicArrayFieldTypeInferencers
+    ) {
         this.mapperParsers = Collections.unmodifiableMap(new LinkedHashMap<>(mapperParsers));
         this.metadataMapperParsers = Collections.unmodifiableMap(new LinkedHashMap<>(metadataMapperParsers));
         this.fieldFilter = fieldFilter;
+        this.dynamicArrayFieldTypeInferencers = Collections.unmodifiableList(new ArrayList<>(dynamicArrayFieldTypeInferencers));
     }
 
     /**
@@ -97,5 +111,12 @@ public final class MapperRegistry {
      */
     public Function<String, Predicate<String>> getFieldFilter() {
         return fieldFilter;
+    }
+
+    /**
+     * Returns the registered dynamic array field type inferencers, in priority order.
+     */
+    public List<DynamicArrayFieldTypeInferencer> getDynamicArrayFieldTypeInferencers() {
+        return dynamicArrayFieldTypeInferencers;
     }
 }

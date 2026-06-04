@@ -32,6 +32,7 @@
 
 package org.opensearch.plugins;
 
+import org.opensearch.index.mapper.DynamicArrayFieldTypeInferencer;
 import org.opensearch.index.mapper.Mapper;
 import org.opensearch.index.mapper.MappingTransformer;
 import org.opensearch.index.mapper.MetadataFieldMapper;
@@ -98,6 +99,15 @@ public interface MapperPlugin {
      *
      */
     default List<MappingTransformer> getMappingTransformers() {
+        return Collections.emptyList();
+    }
+
+    /**
+     * Returns dynamic array field type inferencers provided by this plugin.
+     * These are consulted when an unmapped field contains a numeric array during document indexing.
+     * The first inferencer to claim a field wins.
+     */
+    default List<DynamicArrayFieldTypeInferencer> getDynamicArrayFieldTypeInferencers() {
         return Collections.emptyList();
     }
 }
