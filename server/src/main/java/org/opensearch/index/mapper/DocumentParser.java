@@ -1097,6 +1097,7 @@ final class DocumentParser {
                         case TRUE:
                         case STRICT_ALLOW_TEMPLATES:
                         case FALSE_ALLOW_TEMPLATES:
+                            // First, try template matching with OBJECT type (existing behavior).
                             Mapper.Builder builder = findTemplateBuilder(
                                 context,
                                 arrayFieldName,
@@ -1104,6 +1105,17 @@ final class DocumentParser {
                                 dynamic,
                                 parentMapper.fullPath()
                             );
+                            // If no OBJECT template matched, try KNN_VECTOR template matching.
+                            // This allows match_mapping_type: "knn_vector" to work.
+                            if (builder == null) {
+                                builder = findTemplateBuilder(
+                                    context,
+                                    arrayFieldName,
+                                    XContentFieldType.KNN_VECTOR,
+                                    dynamic,
+                                    parentMapper.fullPath()
+                                );
+                            }
                             if (builder == null) {
                                 if (dynamic == ObjectMapper.Dynamic.FALSE_ALLOW_TEMPLATES) {
                                     context.parser().skipChildren();
@@ -1199,6 +1211,79 @@ final class DocumentParser {
             if (inferredType != null) {
                 winningInferencer = inferencer;
                 break;
+            }
+        }
+
+        // If no inferencer claimed a flat array AND first element is an object AND there are
+        // multiple elements, deep-inspect the first object for vector sub-fields.
+        // If found, create a nested ObjectMapper so each element gets its own Lucene document.
+        if (inferredType == null && firstElementToken == XContentParser.Token.START_OBJECT && arrayLength > 1) {
+            boolean hasVectorSubField = false;
+            try (
+                XContentParser deepParser = parser.contentType()
+                    .xContent()
+                    .createParser(parser.getXContentRegistry(), parser.getDeprecationHandler(), arrayBytes)
+            ) {
+                deepParser.nextToken(); // START_ARRAY
+                deepParser.nextToken(); // START_OBJECT (first element)
+                while (deepParser.nextToken() != XContentParser.Token.END_OBJECT) {
+                    if (deepParser.currentToken() == XContentParser.Token.FIELD_NAME) {
+                        String subFieldName = deepParser.currentName();
+                        XContentParser.Token subToken = deepParser.nextToken();
+                        if (subToken == XContentParser.Token.START_ARRAY) {
+                            // Count sub-array elements and check if numeric
+                            int subLength = 0;
+                            XContentParser.Token subFirstToken = null;
+                            while (deepParser.nextToken() != XContentParser.Token.END_ARRAY) {
+                                subLength++;
+                                if (subFirstToken == null) subFirstToken = deepParser.currentToken();
+                            }
+                            boolean subIsNumeric = subFirstToken == XContentParser.Token.VALUE_NUMBER;
+                            // Ask inferencers if this sub-field qualifies
+                            for (DynamicArrayFieldTypeInferencer inf : inferencers) {
+                                if (inf.inferType(subFieldName, subLength, subIsNumeric, context.indexSettings()) != null) {
+                                    hasVectorSubField = true;
+                                    break;
+                                }
+                            }
+                            if (hasVectorSubField) break;
+                        } else if (subToken == XContentParser.Token.START_OBJECT) {
+                            deepParser.skipChildren();
+                        }
+                    }
+                }
+            }
+
+            if (hasVectorSubField) {
+                // Build a nested ObjectMapper for the array field
+                ObjectMapper.Builder nestedBuilder = new ObjectMapper.Builder(arrayFieldName);
+                nestedBuilder.nested(ObjectMapper.Nested.newNested());
+                Mapper.BuilderContext builderContext = new Mapper.BuilderContext(
+                    context.indexSettings().getSettings(), context.path()
+                );
+                ObjectMapper nestedMapper = nestedBuilder.build(builderContext);
+                context.addDynamicMapper(nestedMapper);
+
+                // Replay: iterate the buffered array and call parseObjectOrNested directly
+                // with the nested mapper for each element. This ensures nestedContext() is called
+                // for each object, creating separate Lucene documents.
+                try (
+                    XContentParser replayParser = parser.contentType()
+                        .xContent()
+                        .createParser(parser.getXContentRegistry(), parser.getDeprecationHandler(), arrayBytes)
+                ) {
+                    replayParser.nextToken(); // START_ARRAY
+                    ParseContext replayContext = context.switchParser(replayParser);
+                    context.path().add(arrayFieldName);
+                    XContentParser.Token elementToken;
+                    while ((elementToken = replayParser.nextToken()) != XContentParser.Token.END_ARRAY) {
+                        if (elementToken == XContentParser.Token.START_OBJECT) {
+                            parseObjectOrNested(replayContext, nestedMapper);
+                        }
+                    }
+                    context.path().remove();
+                }
+                return true;
             }
         }
 

@@ -178,6 +178,17 @@ public class DynamicTemplate implements ToXContentObject {
             public String toString() {
                 return "binary";
             }
+        },
+        KNN_VECTOR {
+            @Override
+            public String defaultMappingType() {
+                return "knn_vector";
+            }
+
+            @Override
+            public String toString() {
+                return "knn_vector";
+            }
         };
 
         public static XContentFieldType fromString(String value) {
