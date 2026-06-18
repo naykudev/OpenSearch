@@ -1097,7 +1097,7 @@ final class DocumentParser {
                         case TRUE:
                         case STRICT_ALLOW_TEMPLATES:
                         case FALSE_ALLOW_TEMPLATES:
-                            // First, try template matching with OBJECT type (existing behavior).
+                            // Try template matching with OBJECT type (existing behavior).
                             Mapper.Builder builder = findTemplateBuilder(
                                 context,
                                 arrayFieldName,
@@ -1105,17 +1105,6 @@ final class DocumentParser {
                                 dynamic,
                                 parentMapper.fullPath()
                             );
-                            // If no OBJECT template matched, try KNN_VECTOR template matching.
-                            // This allows match_mapping_type: "knn_vector" to work.
-                            if (builder == null) {
-                                builder = findTemplateBuilder(
-                                    context,
-                                    arrayFieldName,
-                                    XContentFieldType.KNN_VECTOR,
-                                    dynamic,
-                                    parentMapper.fullPath()
-                                );
-                            }
                             if (builder == null) {
                                 if (dynamic == ObjectMapper.Dynamic.FALSE_ALLOW_TEMPLATES) {
                                     context.parser().skipChildren();
@@ -1204,6 +1193,39 @@ final class DocumentParser {
 
         // Consult inferencers
         boolean isNumericArray = firstElementToken == XContentParser.Token.VALUE_NUMBER;
+
+        // If the array is numeric, try KNN_VECTOR template matching before auto-inference.
+        // This is done here (not earlier) because we need to confirm the array is numeric first —
+        // match_mapping_type: "knn_vector" should only fire for numeric arrays, same as
+        // match_mapping_type: "long" only fires for integer values.
+        if (isNumericArray) {
+            ObjectMapper.Dynamic dynamic = dynamicOrDefault(parentMapper, context);
+            Mapper.Builder knnTemplateBuilder = findTemplateBuilder(
+                context, arrayFieldName, XContentFieldType.KNN_VECTOR, dynamic, parentMapper.fullPath()
+            );
+            if (knnTemplateBuilder != null) {
+                Mapper.BuilderContext builderContext = new Mapper.BuilderContext(
+                    context.indexSettings().getSettings(), context.path()
+                );
+                Mapper mapper = knnTemplateBuilder.build(builderContext);
+                if (parsesArrayValue(mapper)) {
+                    context.addDynamicMapper(mapper);
+                    try (
+                        XContentParser replayParser = parser.contentType()
+                            .xContent()
+                            .createParser(parser.getXContentRegistry(), parser.getDeprecationHandler(), arrayBytes)
+                    ) {
+                        replayParser.nextToken(); // START_ARRAY
+                        ParseContext replayContext = context.switchParser(replayParser);
+                        context.path().add(arrayFieldName);
+                        parseObjectOrField(replayContext, mapper);
+                        context.path().remove();
+                    }
+                    return true;
+                }
+            }
+        }
+
         String inferredType = null;
         DynamicArrayFieldTypeInferencer winningInferencer = null;
         for (DynamicArrayFieldTypeInferencer inferencer : inferencers) {
