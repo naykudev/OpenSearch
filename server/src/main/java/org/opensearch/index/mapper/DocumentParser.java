@@ -622,6 +622,17 @@ final class DocumentParser {
                         parser.skipChildren();
                     }
                 } else {
+                    // Before branching by token type, offer the field to plugin inferencers.
+                    // This is the single convergence point where we know the field name, the
+                    // incoming token type, and paths — before the code fans out to parseObject /
+                    // parseArray / parseValue. Placing the hook here means one method covers arrays,
+                    // objects, and scalars rather than requiring three separate hooks. The hook only
+                    // fires for unmapped fields; if the field has a mapper we skip directly to the
+                    // switch below via the early-return inside tryPluginInference.
+                    if (tryPluginInference(context, mapper, currentFieldName, paths)) {
+                        token = parser.nextToken();
+                        continue;
+                    }
                     // Process different token types during object parsing
                     switch (token) {
                         case START_OBJECT:
@@ -1110,9 +1121,6 @@ final class DocumentParser {
                                     context.parser().skipChildren();
                                     break;
                                 }
-                                if (tryDynamicArrayTypeInference(context, parentMapper, arrayFieldName)) {
-                                    break;
-                                }
                                 parseNonDynamicArray(context, parentMapper, lastFieldName, arrayFieldName);
                             } else {
                                 Mapper.BuilderContext builderContext = new Mapper.BuilderContext(
@@ -1149,213 +1157,275 @@ final class DocumentParser {
         return mapper instanceof FieldMapper fieldMapper && fieldMapper.parsesArrayValue();
     }
 
-    private static boolean tryDynamicArrayTypeInference(ParseContext context, ObjectMapper parentMapper, String arrayFieldName)
+    /**
+     * Offers an unmapped field to all registered plugin inferencers and plugin-registered dynamic template types
+     * before the normal token-type branching takes place in {@link #innerParseObject}.
+     *
+     * <p>This is called at the single convergence point in {@code innerParseObject} where the field name,
+     * the incoming token type, and the parser position are all known simultaneously — before the code fans
+     * out into {@code parseObject} / {@code parseArray} / {@code parseValue}. Placing the hook here means
+     * one method handles arrays, objects, and scalars without requiring separate hooks per token type,
+     * making the SPI genuinely generic rather than array-specific.
+     *
+     * <p>Fast-path exits (no buffering, no deserialization):
+     * <ul>
+     *   <li>No inferencers registered ({@code inferencers.isEmpty()}) — zero overhead.</li>
+     *   <li>Field is already mapped ({@code getMapper()} returns non-null) — delegate to normal path.</li>
+     *   <li>Dynamic mapping is {@code STRICT} or {@code FALSE} on the parent object — existing behavior applies.</li>
+     * </ul>
+     *
+     * <p>When buffering does occur, the content is kept for replay: if no plugin claims the field, the
+     * same bytes are replayed through the normal unmapped-field logic so existing behavior is preserved.
+     *
+     * @return {@code true} if this method consumed the parser (either a plugin claimed the field or the
+     *         content was replayed through the existing path); {@code false} to fall through to the normal
+     *         token-type switch in {@code innerParseObject}.
+     */
+    private static boolean tryPluginInference(ParseContext context, ObjectMapper parentMapper, String fieldName, String[] paths)
         throws IOException {
-        List<DynamicArrayFieldTypeInferencer> inferencers = context.mapperService().getDynamicArrayFieldTypeInferencers();
-        if (inferencers.isEmpty()) {
+        // Fast path: no plugins registered — zero overhead
+        List<DynamicFieldTypeInferencer> inferencers = context.mapperService().getDynamicFieldTypeInferencers();
+        Map<String, DynamicTemplateTypeHandler> templateTypes = context.mapperService().getDynamicTemplateTypes();
+        if (inferencers.isEmpty() && templateTypes.isEmpty()) {
+            return false;
+        }
+
+        // Fast path: field is already mapped — let the normal path handle it
+        Mapper existingMapper = getMapper(context, parentMapper, fieldName, paths);
+        if (existingMapper != null) {
+            return false;
+        }
+
+        // Only fire for dynamic=TRUE / STRICT_ALLOW_TEMPLATES / FALSE_ALLOW_TEMPLATES
+        final String[] resolvedPaths = paths != null ? paths : splitAndValidatePath(fieldName);
+        Tuple<Integer, ObjectMapper> parentMapperTuple = getDynamicParentMapper(context, resolvedPaths, parentMapper);
+        ObjectMapper resolvedParent = parentMapperTuple.v2();
+        ObjectMapper.Dynamic dynamic = dynamicOrDefault(resolvedParent, context);
+        if (dynamic == ObjectMapper.Dynamic.STRICT || dynamic == ObjectMapper.Dynamic.FALSE) {
+            // Release path-slots added by getDynamicParentMapper before returning
+            for (int i = 0; i < parentMapperTuple.v1(); i++) {
+                context.path().remove();
+            }
             return false;
         }
 
         XContentParser parser = context.parser();
+        MediaType contentType = parser.contentType();
 
-        // Buffer the array (parser is at START_ARRAY)
-        byte[] arrayBytes;
-        try (XContentBuilder bufferBuilder = XContentBuilder.builder(parser.contentType().xContent())) {
+        // Buffer the complete field value — needed for replay regardless of whether
+        // a plugin claims the field or not (streaming parser can only be read once)
+        byte[] rawContent;
+        try (XContentBuilder bufferBuilder = XContentBuilder.builder(contentType.xContent())) {
             bufferBuilder.copyCurrentStructure(parser);
-            arrayBytes = BytesReference.toBytes(BytesReference.bytes(bufferBuilder));
+            rawContent = BytesReference.toBytes(BytesReference.bytes(bufferBuilder));
         }
 
-        // Inspect: count elements and detect first element token type
-        int arrayLength = 0;
-        XContentParser.Token firstElementToken = null;
-        try (
-            XContentParser inspectParser = parser.contentType()
-                .xContent()
-                .createParser(parser.getXContentRegistry(), parser.getDeprecationHandler(), arrayBytes)
-        ) {
-            XContentParser.Token token = inspectParser.nextToken(); // START_ARRAY
-            while ((token = inspectParser.nextToken()) != XContentParser.Token.END_ARRAY) {
-                if (token == null) break;
-                arrayLength++;
-                if (firstElementToken == null) {
-                    firstElementToken = token;
-                }
-                if (token == XContentParser.Token.START_OBJECT || token == XContentParser.Token.START_ARRAY) {
-                    inspectParser.skipChildren();
-                }
-            }
-        }
+        // Hand plugins a factory that produces a fresh parser over the buffered bytes rather than a
+        // pre-deserialized object. Core stays free of any representation contract: each plugin decides
+        // how to read the value (stream tokens, or call readValueAsObject for a plain List/Map view).
+        // Plugins whose config is already complete never call get(), so no parsing happens for them.
+        final FieldValueParserSupplier parserFactory = () -> {
+            XContentParser valueParser = contentType.xContent()
+                .createParser(parser.getXContentRegistry(), parser.getDeprecationHandler(), rawContent);
+            valueParser.nextToken(); // position at the start of the value
+            return valueParser;
+        };
 
-        if (arrayLength == 0 || firstElementToken == null) {
-            replayBufferedArray(context, parentMapper, arrayFieldName, arrayBytes);
-            return true;
-        }
+        final String resolvedFieldName = resolvedPaths[resolvedPaths.length - 1];
 
-        // Consult inferencers
-        boolean isNumericArray = firstElementToken == XContentParser.Token.VALUE_NUMBER;
-
-        // If the array is numeric, try KNN_VECTOR template matching before auto-inference.
-        // This is done here (not earlier) because we need to confirm the array is numeric first —
-        // match_mapping_type: "knn_vector" should only fire for numeric arrays, same as
-        // match_mapping_type: "long" only fires for integer values.
-        if (isNumericArray) {
-            ObjectMapper.Dynamic dynamic = dynamicOrDefault(parentMapper, context);
-            Mapper.Builder knnTemplateBuilder = findTemplateBuilder(
-                context, arrayFieldName, XContentFieldType.KNN_VECTOR, dynamic, parentMapper.fullPath()
+        // Step 1: Check plugin-registered dynamic templates first — explicit user intent beats
+        // auto-inference. A user who writes match_mapping_type: "knn_vector" with dimension: 64
+        // has declared their intent; we must not reject it because it falls below the inferencer
+        // threshold. Template matching is already scoped by the user's match/path_match patterns
+        // on the DynamicTemplate, so it only fires for fields the user intended.
+        for (Map.Entry<String, DynamicTemplateTypeHandler> entry : templateTypes.entrySet()) {
+            Mapper.Builder templateBuilder = findPluginTemplateBuilder(
+                context,
+                resolvedFieldName,
+                entry,
+                dynamic,
+                resolvedParent.fullPath(),
+                parserFactory
             );
-            if (knnTemplateBuilder != null) {
-                Mapper.BuilderContext builderContext = new Mapper.BuilderContext(
-                    context.indexSettings().getSettings(), context.path()
+            if (templateBuilder != null) {
+                Mapper.BuilderContext templateBuilderContext = new Mapper.BuilderContext(
+                    context.indexSettings().getSettings(),
+                    context.path()
                 );
-                Mapper mapper = knnTemplateBuilder.build(builderContext);
-                if (parsesArrayValue(mapper)) {
-                    context.addDynamicMapper(mapper);
-                    try (
-                        XContentParser replayParser = parser.contentType()
-                            .xContent()
-                            .createParser(parser.getXContentRegistry(), parser.getDeprecationHandler(), arrayBytes)
-                    ) {
-                        replayParser.nextToken(); // START_ARRAY
-                        ParseContext replayContext = context.switchParser(replayParser);
-                        context.path().add(arrayFieldName);
-                        parseObjectOrField(replayContext, mapper);
-                        context.path().remove();
-                    }
-                    return true;
-                }
-            }
-        }
-
-        String inferredType = null;
-        DynamicArrayFieldTypeInferencer winningInferencer = null;
-        for (DynamicArrayFieldTypeInferencer inferencer : inferencers) {
-            inferredType = inferencer.inferType(arrayFieldName, arrayLength, isNumericArray, context.indexSettings());
-            if (inferredType != null) {
-                winningInferencer = inferencer;
-                break;
-            }
-        }
-
-        // If no inferencer claimed a flat array AND first element is an object AND there are
-        // multiple elements, deep-inspect the first object for vector sub-fields.
-        // If found, create a nested ObjectMapper so each element gets its own Lucene document.
-        if (inferredType == null && firstElementToken == XContentParser.Token.START_OBJECT && arrayLength > 1) {
-            boolean hasVectorSubField = false;
-            try (
-                XContentParser deepParser = parser.contentType()
-                    .xContent()
-                    .createParser(parser.getXContentRegistry(), parser.getDeprecationHandler(), arrayBytes)
-            ) {
-                deepParser.nextToken(); // START_ARRAY
-                deepParser.nextToken(); // START_OBJECT (first element)
-                while (deepParser.nextToken() != XContentParser.Token.END_OBJECT) {
-                    if (deepParser.currentToken() == XContentParser.Token.FIELD_NAME) {
-                        String subFieldName = deepParser.currentName();
-                        XContentParser.Token subToken = deepParser.nextToken();
-                        if (subToken == XContentParser.Token.START_ARRAY) {
-                            // Count sub-array elements and check if numeric
-                            int subLength = 0;
-                            XContentParser.Token subFirstToken = null;
-                            while (deepParser.nextToken() != XContentParser.Token.END_ARRAY) {
-                                subLength++;
-                                if (subFirstToken == null) subFirstToken = deepParser.currentToken();
-                            }
-                            boolean subIsNumeric = subFirstToken == XContentParser.Token.VALUE_NUMBER;
-                            // Ask inferencers if this sub-field qualifies
-                            for (DynamicArrayFieldTypeInferencer inf : inferencers) {
-                                if (inf.inferType(subFieldName, subLength, subIsNumeric, context.indexSettings()) != null) {
-                                    hasVectorSubField = true;
-                                    break;
-                                }
-                            }
-                            if (hasVectorSubField) break;
-                        } else if (subToken == XContentParser.Token.START_OBJECT) {
-                            deepParser.skipChildren();
-                        }
-                    }
-                }
-            }
-
-            if (hasVectorSubField) {
-                // Build a nested ObjectMapper for the array field
-                ObjectMapper.Builder nestedBuilder = new ObjectMapper.Builder(arrayFieldName);
-                nestedBuilder.nested(ObjectMapper.Nested.newNested());
-                Mapper.BuilderContext builderContext = new Mapper.BuilderContext(
-                    context.indexSettings().getSettings(), context.path()
-                );
-                ObjectMapper nestedMapper = nestedBuilder.build(builderContext);
-                context.addDynamicMapper(nestedMapper);
-
-                // Replay: iterate the buffered array and call parseObjectOrNested directly
-                // with the nested mapper for each element. This ensures nestedContext() is called
-                // for each object, creating separate Lucene documents.
+                Mapper templateMapper = templateBuilder.build(templateBuilderContext);
+                context.addDynamicMapper(templateMapper);
                 try (
-                    XContentParser replayParser = parser.contentType()
-                        .xContent()
-                        .createParser(parser.getXContentRegistry(), parser.getDeprecationHandler(), arrayBytes)
+                    XContentParser replayParser = contentType.xContent()
+                        .createParser(context.parser().getXContentRegistry(), context.parser().getDeprecationHandler(), rawContent)
                 ) {
-                    replayParser.nextToken(); // START_ARRAY
+                    replayParser.nextToken();
                     ParseContext replayContext = context.switchParser(replayParser);
-                    context.path().add(arrayFieldName);
-                    XContentParser.Token elementToken;
-                    while ((elementToken = replayParser.nextToken()) != XContentParser.Token.END_ARRAY) {
-                        if (elementToken == XContentParser.Token.START_OBJECT) {
-                            parseObjectOrNested(replayContext, nestedMapper);
-                        }
-                    }
+                    context.path().add(resolvedFieldName);
+                    parseObjectOrField(replayContext, templateMapper);
+                    context.path().remove();
+                }
+                for (int i = 0; i < parentMapperTuple.v1(); i++) {
                     context.path().remove();
                 }
                 return true;
             }
         }
 
-        if (inferredType == null) {
-            replayBufferedArray(context, parentMapper, arrayFieldName, arrayBytes);
+        // Step 2: No template matched — run the inferencer as the auto-detection fallback.
+        // This is the path for fields with no user-defined template: the inferencer checks
+        // whether the field looks like a plugin-managed type (e.g. numeric array >= 128 elements).
+        Map<String, Object> inferredFieldMapping = null;
+        for (DynamicFieldTypeInferencer inferencer : inferencers) {
+            try {
+                inferredFieldMapping = inferencer.inferFieldType(parserFactory);
+            } catch (Exception e) {
+                // A buggy inferencer must not break document parsing
+                continue;
+            }
+            if (inferredFieldMapping != null) {
+                break;
+            }
+        }
+
+        if (inferredFieldMapping == null) { // put these into one if
+            // No template and no inferencer claimed this field — fall through to existing path
+            replayThroughExistingPath(context, resolvedParent, resolvedFieldName, rawContent, parentMapperTuple.v1());
             return true;
         }
 
-        // Build the mapper from the inferred type
+        String inferredType = (String) inferredFieldMapping.get("type");
+        if (inferredType == null) {
+            replayThroughExistingPath(context, resolvedParent, resolvedFieldName, rawContent, parentMapperTuple.v1());
+            return true;
+        }
+
+        // Step 3: No template — use inferencer result directly.
         Mapper.TypeParser.ParserContext parserContext = context.docMapperParser().parserContext();
         Mapper.TypeParser typeParser = parserContext.typeParser(inferredType);
         if (typeParser == null) {
-            replayBufferedArray(context, parentMapper, arrayFieldName, arrayBytes);
+            // Unknown type — fall through to existing path rather than failing
+            replayThroughExistingPath(context, resolvedParent, resolvedFieldName, rawContent, parentMapperTuple.v1());
             return true;
         }
 
-        Map<String, Object> fieldConfig = winningInferencer.getFieldConfiguration(arrayFieldName, arrayLength);
-        Mapper.Builder<?> mapperBuilder = typeParser.parse(arrayFieldName, fieldConfig, parserContext);
+        Mapper.Builder<?> builder = typeParser.parse(resolvedFieldName, inferredFieldMapping, parserContext);
         Mapper.BuilderContext builderContext = new Mapper.BuilderContext(context.indexSettings().getSettings(), context.path());
-        Mapper mapper = mapperBuilder.build(builderContext);
-        context.addDynamicMapper(mapper);
+        Mapper inferredMapper = builder.build(builderContext);
+        context.addDynamicMapper(inferredMapper);
 
-        // Parse the buffered array with the new mapper
+        // Replay buffered content through the new mapper
         try (
-            XContentParser replayParser = parser.contentType()
-                .xContent()
-                .createParser(parser.getXContentRegistry(), parser.getDeprecationHandler(), arrayBytes)
+            XContentParser replayParser = contentType.xContent()
+                .createParser(parser.getXContentRegistry(), parser.getDeprecationHandler(), rawContent)
         ) {
-            replayParser.nextToken(); // position at START_ARRAY
+            replayParser.nextToken(); // position at the start of the value
             ParseContext replayContext = context.switchParser(replayParser);
-            context.path().add(arrayFieldName);
-            parseObjectOrField(replayContext, mapper);
+            context.path().add(resolvedFieldName);
+            parseObjectOrField(replayContext, inferredMapper);
             context.path().remove();
         }
 
+        for (int i = 0; i < parentMapperTuple.v1(); i++) {
+            context.path().remove();
+        }
         return true;
     }
 
-    private static void replayBufferedArray(ParseContext context, ObjectMapper parentMapper, String arrayFieldName, byte[] arrayBytes)
-        throws IOException {
+    /**
+     * Convenience helper for plugin inferencers and template handlers: reads the parser's current
+     * value into a plain Java object.
+     * <ul>
+     *   <li>JSON array  → {@code List<Object>}</li>
+     *   <li>JSON object → {@code Map<String, Object>}</li>
+     *   <li>number      → {@code Number}</li>
+     *   <li>string      → {@code String}</li>
+     *   <li>boolean     → {@code Boolean}</li>
+     *   <li>null        → {@code null}</li>
+     * </ul>
+     * The parser must be positioned at the value's first token — which is exactly where the factory
+     * handed to {@link DynamicFieldTypeInferencer#inferFieldType} and
+     * {@link DynamicTemplateTypeHandler#adjustMappingConfig} leaves it. Plugins that prefer streaming
+     * over materializing an object can walk the parser tokens directly instead of calling this.
+     */
+    public static Object readValueAsObject(XContentParser parser) throws IOException {
+        return readCurrentTokenAsObject(parser);
+    }
+
+    /**
+     * Reads the parser's current token (already positioned) into a plain Java object.
+     * Handles nested arrays and objects recursively. Used by {@link #readValueAsObject}.
+     */
+    private static Object readCurrentTokenAsObject(XContentParser parser) throws IOException {
+        XContentParser.Token token = parser.currentToken();
+        if (token == null) return null;
+        switch (token) {
+            case START_ARRAY:
+                List<Object> list = new ArrayList<>();
+                while (parser.nextToken() != XContentParser.Token.END_ARRAY) {
+                    list.add(readCurrentTokenAsObject(parser));
+                }
+                return list;
+            case START_OBJECT:
+                Map<String, Object> map = new HashMap<>();
+                while (parser.nextToken() != XContentParser.Token.END_OBJECT) {
+                    String key = parser.currentName();
+                    parser.nextToken();
+                    map.put(key, readCurrentTokenAsObject(parser));
+                }
+                return map;
+            case VALUE_STRING:
+                return parser.text();
+            case VALUE_NUMBER:
+                return parser.numberValue();
+            case VALUE_BOOLEAN:
+                return parser.booleanValue();
+            case VALUE_NULL:
+                return null;
+            default:
+                return null;
+        }
+    }
+
+    /**
+     * Replays raw-buffered field content through the normal unmapped-field logic — dynamic
+     * templates, parseDynamicValue, parseNonDynamicArray — as if the buffer had never been created.
+     */
+    private static void replayThroughExistingPath(
+        ParseContext context,
+        ObjectMapper parentMapper,
+        String fieldName,
+        byte[] rawContent,
+        int pathsAddedByGetDynamicParentMapper
+    ) throws IOException {
         XContentParser originalParser = context.parser();
         try (
             XContentParser replayParser = originalParser.contentType()
                 .xContent()
-                .createParser(originalParser.getXContentRegistry(), originalParser.getDeprecationHandler(), arrayBytes)
+                .createParser(originalParser.getXContentRegistry(), originalParser.getDeprecationHandler(), rawContent)
         ) {
-            replayParser.nextToken(); // position at START_ARRAY
+            replayParser.nextToken(); // position at value start
             ParseContext replayContext = context.switchParser(replayParser);
-            final String[] replayPaths = splitAndValidatePath(arrayFieldName);
-            parseNonDynamicArray(replayContext, parentMapper, arrayFieldName, arrayFieldName);
+            XContentParser.Token replayToken = replayParser.currentToken();
+            String[] replayPaths = splitAndValidatePath(fieldName);
+            switch (replayToken) {
+                case START_OBJECT:
+                    parseObject(replayContext, parentMapper, fieldName, replayPaths);
+                    break;
+                case START_ARRAY:
+                    parseArray(replayContext, parentMapper, fieldName, replayPaths);
+                    break;
+                case VALUE_NULL:
+                    parseNullValue(replayContext, parentMapper, fieldName, replayPaths);
+                    break;
+                default:
+                    if (replayToken != null && replayToken.isValue()) {
+                        parseValue(replayContext, parentMapper, fieldName, replayToken, replayPaths);
+                    }
+            }
+        } finally {
+            for (int i = 0; i < pathsAddedByGetDynamicParentMapper; i++) {
+                context.path().remove();
+            }
         }
     }
 
@@ -2007,5 +2077,61 @@ final class DocumentParser {
             throw new StrictDynamicMappingException(dynamic.name().toLowerCase(Locale.ROOT), fieldFullPath, name);
         }
         return builder;
+    }
+
+    /**
+     * Attempts to find a plugin-registered dynamic template whose {@code match_mapping_type} equals
+     * {@code pluginType} and whose path/name patterns match the field being parsed.
+     *
+     * <p>If a matching template is found, calls {@link DynamicTemplateTypeHandler#adjustMappingConfig}
+     * with a factory that produces a fresh parser over the buffered field bytes, so the handler can
+     * inject any required parameters (e.g. dimension) before the {@link Mapper.TypeParser} builds the
+     * mapper. This runs before TypeParser so that parameters that can only be inferred from the data
+     * are present when the mapper is constructed. Handlers whose config is already complete never call
+     * {@code get()}, so no parsing happens for fully-specified templates.
+     *
+     * @param name          the simple field name being parsed (last path component)
+     * @param entry         the plugin type string (e.g. {@code "knn_vector"}) and its handler
+     * @param parserFactory produces a fresh parser over the buffered field bytes
+     * @return a {@link Mapper.Builder} ready to build the mapper, or {@code null} if no template matched
+     */
+    @SuppressWarnings("rawtypes")
+    private static Mapper.Builder findPluginTemplateBuilder(
+        ParseContext context,
+        String name,
+        Map.Entry<String, DynamicTemplateTypeHandler> entry,
+        ObjectMapper.Dynamic dynamic,
+        String fieldFullPath,
+        FieldValueParserSupplier parserFactory
+    ) throws IOException {
+        String pluginType = entry.getKey();
+        DynamicTemplateTypeHandler handler = entry.getValue();
+        DynamicTemplate dynamicTemplate = findPluginTemplate(context.root(), context.path(), name, pluginType);
+        if (dynamicTemplate == null) {
+            return null;
+        }
+        String mappingType = dynamicTemplate.mappingType(pluginType);
+        Mapper.TypeParser.ParserContext parserContext = context.docMapperParser().parserContext();
+        Mapper.TypeParser typeParser = parserContext.typeParser(mappingType);
+        if (typeParser == null) {
+            throw new MapperParsingException("failed to find type parsed [" + mappingType + "] for [" + name + "]");
+        }
+        Map<String, Object> mappingConfig = dynamicTemplate.mappingForName(name, pluginType);
+        // The type is implied by match_mapping_type, so a template may omit it from the mapping block
+        // (or omit the block entirely). Ensure the config the parser receives carries the resolved type.
+        mappingConfig.putIfAbsent("type", mappingType);
+        handler.adjustMappingConfig(mappingConfig, parserFactory);
+        return typeParser.parse(name, mappingConfig, parserContext);
+    }
+
+    /** Scans dynamic templates on the root mapper for one whose {@code match_mapping_type} equals {@code pluginType} and whose path/name patterns match. */
+    private static DynamicTemplate findPluginTemplate(RootObjectMapper root, ContentPath path, String name, String pluginType) {
+        final String pathAsString = path.pathAsText(name);
+        for (DynamicTemplate dynamicTemplate : root.dynamicTemplates()) {
+            if (dynamicTemplate.matchesPluginType(pathAsString, name, pluginType)) {
+                return dynamicTemplate;
+            }
+        }
+        return null;
     }
 }

@@ -33,7 +33,8 @@
 package org.opensearch.indices.mapper;
 
 import org.opensearch.common.annotation.PublicApi;
-import org.opensearch.index.mapper.DynamicArrayFieldTypeInferencer;
+import org.opensearch.index.mapper.DynamicFieldTypeInferencer;
+import org.opensearch.index.mapper.DynamicTemplateTypeHandler;
 import org.opensearch.index.mapper.Mapper;
 import org.opensearch.index.mapper.MetadataFieldMapper;
 import org.opensearch.plugins.MapperPlugin;
@@ -57,26 +58,29 @@ public final class MapperRegistry {
     private final Map<String, Mapper.TypeParser> mapperParsers;
     private final Map<String, MetadataFieldMapper.TypeParser> metadataMapperParsers;
     private final Function<String, Predicate<String>> fieldFilter;
-    private final List<DynamicArrayFieldTypeInferencer> dynamicArrayFieldTypeInferencers;
+    private final List<DynamicFieldTypeInferencer> dynamicFieldTypeInferencers;
+    private final Map<String, DynamicTemplateTypeHandler> dynamicTemplateTypes;
 
     public MapperRegistry(
         Map<String, Mapper.TypeParser> mapperParsers,
         Map<String, MetadataFieldMapper.TypeParser> metadataMapperParsers,
         Function<String, Predicate<String>> fieldFilter
     ) {
-        this(mapperParsers, metadataMapperParsers, fieldFilter, Collections.emptyList());
+        this(mapperParsers, metadataMapperParsers, fieldFilter, Collections.emptyList(), Collections.emptyMap());
     }
 
     public MapperRegistry(
         Map<String, Mapper.TypeParser> mapperParsers,
         Map<String, MetadataFieldMapper.TypeParser> metadataMapperParsers,
         Function<String, Predicate<String>> fieldFilter,
-        List<DynamicArrayFieldTypeInferencer> dynamicArrayFieldTypeInferencers
+        List<DynamicFieldTypeInferencer> dynamicFieldTypeInferencers,
+        Map<String, DynamicTemplateTypeHandler> dynamicTemplateTypes
     ) {
         this.mapperParsers = Collections.unmodifiableMap(new LinkedHashMap<>(mapperParsers));
         this.metadataMapperParsers = Collections.unmodifiableMap(new LinkedHashMap<>(metadataMapperParsers));
         this.fieldFilter = fieldFilter;
-        this.dynamicArrayFieldTypeInferencers = Collections.unmodifiableList(new ArrayList<>(dynamicArrayFieldTypeInferencers));
+        this.dynamicFieldTypeInferencers = Collections.unmodifiableList(new ArrayList<>(dynamicFieldTypeInferencers));
+        this.dynamicTemplateTypes = Collections.unmodifiableMap(new LinkedHashMap<>(dynamicTemplateTypes));
     }
 
     /**
@@ -114,9 +118,14 @@ public final class MapperRegistry {
     }
 
     /**
-     * Returns the registered dynamic array field type inferencers, in priority order.
+     * Returns the registered dynamic field type inferencers, in priority order.
      */
-    public List<DynamicArrayFieldTypeInferencer> getDynamicArrayFieldTypeInferencers() {
-        return dynamicArrayFieldTypeInferencers;
+    public List<DynamicFieldTypeInferencer> getDynamicFieldTypeInferencers() {
+        return dynamicFieldTypeInferencers;
+    }
+
+    /** Returns the registered dynamic template type handlers keyed by their match_mapping_type string. */
+    public Map<String, DynamicTemplateTypeHandler> getDynamicTemplateTypes() {
+        return dynamicTemplateTypes;
     }
 }
