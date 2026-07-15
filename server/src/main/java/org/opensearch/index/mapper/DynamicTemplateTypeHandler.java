@@ -25,8 +25,7 @@ import java.util.Map;
  * bytes. A handler whose template config is already complete never calls {@code get()},
  * so no parsing happens for fully-specified templates. A handler that needs a
  * data-derived parameter (e.g. a vector's dimension) creates a parser and reads what it
- * needs. The convenience helper {@link DocumentParser#readValueAsObject(XContentParser)}
- * is available for handlers that just want a plain {@code List}/{@code Map}/scalar view.
+ * needs.
  *
  * @opensearch.experimental
  */

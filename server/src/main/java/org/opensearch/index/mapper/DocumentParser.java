@@ -1221,9 +1221,9 @@ final class DocumentParser {
         }
 
         // Hand plugins a factory that produces a fresh parser over the buffered bytes rather than a
-        // pre-deserialized object. Core stays free of any representation contract: each plugin decides
-        // how to read the value (stream tokens, or call readValueAsObject for a plain List/Map view).
-        // Plugins whose config is already complete never call get(), so no parsing happens for them.
+        // pre-deserialized object. Core stays free of any representation contract: each plugin streams
+        // the tokens it needs. Plugins whose config is already complete never call get(), so no parsing
+        // happens for them.
         final FieldValueParserSupplier parserFactory = () -> {
             XContentParser valueParser = contentType.xContent()
                 .createParser(parser.getXContentRegistry(), parser.getDeprecationHandler(), rawContent);
@@ -1329,61 +1329,6 @@ final class DocumentParser {
             context.path().remove();
         }
         return true;
-    }
-
-    /**
-     * Convenience helper for plugin inferencers and template handlers: reads the parser's current
-     * value into a plain Java object.
-     * <ul>
-     *   <li>JSON array  → {@code List<Object>}</li>
-     *   <li>JSON object → {@code Map<String, Object>}</li>
-     *   <li>number      → {@code Number}</li>
-     *   <li>string      → {@code String}</li>
-     *   <li>boolean     → {@code Boolean}</li>
-     *   <li>null        → {@code null}</li>
-     * </ul>
-     * The parser must be positioned at the value's first token — which is exactly where the factory
-     * handed to {@link DynamicFieldTypeInferencer#inferFieldType} and
-     * {@link DynamicTemplateTypeHandler#adjustMappingConfig} leaves it. Plugins that prefer streaming
-     * over materializing an object can walk the parser tokens directly instead of calling this.
-     */
-    public static Object readValueAsObject(XContentParser parser) throws IOException {
-        return readCurrentTokenAsObject(parser);
-    }
-
-    /**
-     * Reads the parser's current token (already positioned) into a plain Java object.
-     * Handles nested arrays and objects recursively. Used by {@link #readValueAsObject}.
-     */
-    private static Object readCurrentTokenAsObject(XContentParser parser) throws IOException {
-        XContentParser.Token token = parser.currentToken();
-        if (token == null) return null;
-        switch (token) {
-            case START_ARRAY:
-                List<Object> list = new ArrayList<>();
-                while (parser.nextToken() != XContentParser.Token.END_ARRAY) {
-                    list.add(readCurrentTokenAsObject(parser));
-                }
-                return list;
-            case START_OBJECT:
-                Map<String, Object> map = new HashMap<>();
-                while (parser.nextToken() != XContentParser.Token.END_OBJECT) {
-                    String key = parser.currentName();
-                    parser.nextToken();
-                    map.put(key, readCurrentTokenAsObject(parser));
-                }
-                return map;
-            case VALUE_STRING:
-                return parser.text();
-            case VALUE_NUMBER:
-                return parser.numberValue();
-            case VALUE_BOOLEAN:
-                return parser.booleanValue();
-            case VALUE_NULL:
-                return null;
-            default:
-                return null;
-        }
     }
 
     /**
@@ -2117,9 +2062,8 @@ final class DocumentParser {
             throw new MapperParsingException("failed to find type parsed [" + mappingType + "] for [" + name + "]");
         }
         Map<String, Object> mappingConfig = dynamicTemplate.mappingForName(name, pluginType);
-        // The type is implied by match_mapping_type, so a template may omit it from the mapping block
-        // (or omit the block entirely). Ensure the config the parser receives carries the resolved type.
-        mappingConfig.putIfAbsent("type", mappingType);
+        // The handler completes the config (injects its own type when omitted, and any data-derived
+        // params such as dimension) before the TypeParser builds the mapper.
         handler.adjustMappingConfig(mappingConfig, parserFactory);
         return typeParser.parse(name, mappingConfig, parserContext);
     }

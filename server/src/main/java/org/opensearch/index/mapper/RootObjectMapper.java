@@ -754,15 +754,23 @@ public class RootObjectMapper extends ObjectMapper {
 
         String templateName = "__dynamic__" + dynamicTemplate.getName();
         Map<String, Object> fieldTypeConfig = dynamicTemplate.mappingForName(templateName, pluginType);
-        // The type is implied by match_mapping_type, so the template may omit it from the mapping block.
-        // Ensure the config the parser receives carries the resolved type (mirrors the document-parse path).
-        fieldTypeConfig.putIfAbsent("type", mappingType);
         if (handler.isConfigComplete(fieldTypeConfig) == false) {
             // Config relies on data-derived parameters; it can only be validated once a document is seen.
             return;
         }
 
-        // Config is fully specified: let the type parser validate it and report any invalid content.
+        // Config is fully specified. Let the handler normalize it (e.g. inject its own type when the
+        // template omitted it) — a complete config never reads the field value, so the supplier is
+        // never invoked at index-creation time. Then hand it to the type parser, which validates the
+        // content and reports any invalid config.
+        try {
+            handler.adjustMappingConfig(fieldTypeConfig, () -> {
+                throw new IllegalStateException("A complete plugin template config must not read the field value");
+            });
+        } catch (IOException e) {
+            // A complete config performs no I/O; treat any failure as non-fatal and defer to doc-parse.
+            return;
+        }
         typeParser.parse(templateName, fieldTypeConfig, parserContext);
     }
 

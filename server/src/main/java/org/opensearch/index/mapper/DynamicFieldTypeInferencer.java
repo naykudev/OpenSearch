@@ -26,11 +26,9 @@ import java.util.Map;
  * <p>Rather than deserializing the field value into a fixed Java representation, core hands the
  * inferencer a {@link FieldValueParserSupplier} that produces a fresh {@link XContentParser} over the
  * buffered bytes. Each call to {@code parserFactory.get()} returns an independent parser positioned before
- * the field value, so the plugin can inspect the content however it needs — streaming through tokens
- * to count array elements, or reading it into a plain object. This keeps core free of any
- * representation contract: each plugin decides how to interpret the value. A convenience helper,
- * {@link DocumentParser#readValueAsObject(XContentParser)}, is available for plugins that just want a
- * plain {@code List}/{@code Map}/scalar view.
+ * the field value, so the plugin can inspect the content however it needs — for example streaming
+ * through tokens to count array elements. This keeps core free of any representation contract: each
+ * plugin decides how to interpret the value.
  *
  * @opensearch.experimental
  */
