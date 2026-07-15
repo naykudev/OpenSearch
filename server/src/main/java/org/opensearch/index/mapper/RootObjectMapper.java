@@ -767,8 +767,10 @@ public class RootObjectMapper extends ObjectMapper {
             handler.adjustMappingConfig(fieldTypeConfig, () -> {
                 throw new IllegalStateException("A complete plugin template config must not read the field value");
             });
-        } catch (IOException e) {
-            // A complete config performs no I/O; treat any failure as non-fatal and defer to doc-parse.
+        } catch (IllegalStateException | IOException e) {
+            // A complete config performs no I/O and must not read the field value. If a handler
+            // violates that contract, treat it as non-fatal and defer validation to document-parse time
+            // rather than failing index creation.
             return;
         }
         typeParser.parse(templateName, fieldTypeConfig, parserContext);
