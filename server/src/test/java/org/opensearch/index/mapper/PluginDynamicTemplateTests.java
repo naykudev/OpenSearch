@@ -45,7 +45,7 @@ public class PluginDynamicTemplateTests extends MapperServiceTestCase {
     /** No-op handler — template config used as-is. Reports its config as always complete. */
     static class MockTemplateTypeHandler implements DynamicTemplateTypeHandler {
         @Override
-        public void adjustMappingConfig(Map<String, Object> mappingConfig, FieldValueParserSupplier parserFactory) {}
+        public void adjustMappingConfig(Map<String, Object> mappingConfig, FieldValueParserSupplier fieldValueParser) {}
 
         @Override
         public boolean isConfigComplete(Map<String, Object> mappingConfig) {
@@ -56,8 +56,8 @@ public class PluginDynamicTemplateTests extends MapperServiceTestCase {
     /** Handler for a data-derived type: config is never complete, so validation is deferred. */
     static class MockInferredTemplateTypeHandler implements DynamicTemplateTypeHandler {
         @Override
-        public void adjustMappingConfig(Map<String, Object> mappingConfig, FieldValueParserSupplier parserFactory) throws IOException {
-            try (XContentParser parser = parserFactory.get()) {
+        public void adjustMappingConfig(Map<String, Object> mappingConfig, FieldValueParserSupplier fieldValueParser) throws IOException {
+            try (XContentParser parser = fieldValueParser.get()) {
                 parser.currentToken();
             }
         }
@@ -74,8 +74,8 @@ public class PluginDynamicTemplateTests extends MapperServiceTestCase {
      */
     static class MockInferencer implements DynamicFieldTypeInferencer {
         @Override
-        public Map<String, Object> inferFieldType(FieldValueParserSupplier parserFactory) throws IOException {
-            try (XContentParser parser = parserFactory.get()) {
+        public Map<String, Object> inferFieldType(FieldValueParserSupplier fieldValueParser) throws IOException {
+            try (XContentParser parser = fieldValueParser.get()) {
                 if (parser.currentToken() != XContentParser.Token.VALUE_NUMBER) return null;
                 if (parser.doubleValue() < 100) return null;
             }

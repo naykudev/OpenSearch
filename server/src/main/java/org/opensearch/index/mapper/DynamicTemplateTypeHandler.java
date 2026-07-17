@@ -37,13 +37,13 @@ public interface DynamicTemplateTypeHandler {
      * Called when a dynamic template matches but before the mapper is constructed.
      *
      * @param mappingConfig the mutable mapping config from the template (modified in place)
-     * @param parserFactory produces a fresh {@link XContentParser} over the buffered field bytes;
+     * @param fieldValueParser produces a fresh {@link XContentParser} over the buffered field bytes;
      *                      only call {@code get()} if the config is missing a parameter that must
      *                      be derived from the data. Close the returned parser (e.g. via
      *                      try-with-resources).
      * @throws IOException if reading from the parser fails
      */
-    void adjustMappingConfig(Map<String, Object> mappingConfig, FieldValueParserSupplier parserFactory) throws IOException;
+    void adjustMappingConfig(Map<String, Object> mappingConfig, FieldValueParserSupplier fieldValueParser) throws IOException;
 
     /**
      * Returns {@code true} if the given template mapping config is fully specified — i.e. building a

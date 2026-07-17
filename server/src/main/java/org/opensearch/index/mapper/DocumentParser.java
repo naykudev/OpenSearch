@@ -1224,7 +1224,7 @@ final class DocumentParser {
         // pre-deserialized object. Core stays free of any representation contract: each plugin streams
         // the tokens it needs. Plugins whose config is already complete never call get(), so no parsing
         // happens for them.
-        final FieldValueParserSupplier parserFactory = () -> {
+        final FieldValueParserSupplier fieldValueParser = () -> {
             XContentParser valueParser = contentType.xContent()
                 .createParser(parser.getXContentRegistry(), parser.getDeprecationHandler(), rawContent);
             valueParser.nextToken(); // position at the start of the value
@@ -1245,7 +1245,7 @@ final class DocumentParser {
                 entry,
                 dynamic,
                 resolvedParent.fullPath(),
-                parserFactory
+                fieldValueParser
             );
             if (templateBuilder != null) {
                 Mapper.BuilderContext templateBuilderContext = new Mapper.BuilderContext(
@@ -1277,7 +1277,7 @@ final class DocumentParser {
         Map<String, Object> inferredFieldMapping = null;
         for (DynamicFieldTypeInferencer inferencer : inferencers) {
             try {
-                inferredFieldMapping = inferencer.inferFieldType(parserFactory);
+                inferredFieldMapping = inferencer.inferFieldType(fieldValueParser);
             } catch (Exception e) {
                 // A buggy inferencer must not break document parsing
                 continue;
@@ -2037,7 +2037,7 @@ final class DocumentParser {
      *
      * @param name          the simple field name being parsed (last path component)
      * @param entry         the plugin type string (e.g. {@code "knn_vector"}) and its handler
-     * @param parserFactory produces a fresh parser over the buffered field bytes
+     * @param fieldValueParser produces a fresh parser over the buffered field bytes
      * @return a {@link Mapper.Builder} ready to build the mapper, or {@code null} if no template matched
      */
     @SuppressWarnings("rawtypes")
@@ -2047,7 +2047,7 @@ final class DocumentParser {
         Map.Entry<String, DynamicTemplateTypeHandler> entry,
         ObjectMapper.Dynamic dynamic,
         String fieldFullPath,
-        FieldValueParserSupplier parserFactory
+        FieldValueParserSupplier fieldValueParser
     ) throws IOException {
         String pluginType = entry.getKey();
         DynamicTemplateTypeHandler handler = entry.getValue();
@@ -2064,7 +2064,7 @@ final class DocumentParser {
         Map<String, Object> mappingConfig = dynamicTemplate.mappingForName(name, pluginType);
         // The handler completes the config (injects its own type when omitted, and any data-derived
         // params such as dimension) before the TypeParser builds the mapper.
-        handler.adjustMappingConfig(mappingConfig, parserFactory);
+        handler.adjustMappingConfig(mappingConfig, fieldValueParser);
         return typeParser.parse(name, mappingConfig, parserContext);
     }
 

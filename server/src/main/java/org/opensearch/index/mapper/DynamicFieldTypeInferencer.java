@@ -25,7 +25,7 @@ import java.util.Map;
  *
  * <p>Rather than deserializing the field value into a fixed Java representation, core hands the
  * inferencer a {@link FieldValueParserSupplier} that produces a fresh {@link XContentParser} over the
- * buffered bytes. Each call to {@code parserFactory.get()} returns an independent parser positioned before
+ * buffered bytes. Each call to {@code fieldValueParser.get()} returns an independent parser positioned before
  * the field value, so the plugin can inspect the content however it needs — for example streaming
  * through tokens to count array elements. This keeps core free of any representation contract: each
  * plugin decides how to interpret the value.
@@ -38,7 +38,7 @@ public interface DynamicFieldTypeInferencer {
     /**
      * Inspect the buffered field value and decide whether to claim it.
      *
-     * @param parserFactory produces a fresh {@link XContentParser} over the buffered field bytes;
+     * @param fieldValueParser produces a fresh {@link XContentParser} over the buffered field bytes;
      *                      call {@code get()} and advance the parser to read the value. The returned
      *                      parser should be closed by the caller (e.g. via try-with-resources).
      * @return a mutable mapping config map with at minimum a {@code "type"} key (e.g.
@@ -47,5 +47,5 @@ public interface DynamicFieldTypeInferencer {
      *         {@code node.remove()} on it during parsing.
      * @throws IOException if reading from the parser fails
      */
-    Map<String, Object> inferFieldType(FieldValueParserSupplier parserFactory) throws IOException;
+    Map<String, Object> inferFieldType(FieldValueParserSupplier fieldValueParser) throws IOException;
 }
