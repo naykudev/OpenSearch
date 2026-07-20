@@ -1224,12 +1224,12 @@ final class DocumentParser {
         // pre-deserialized object. Core stays free of any representation contract: each plugin streams
         // the tokens it needs. Plugins whose config is already complete never call get(), so no parsing
         // happens for them.
-        final FieldValueParserSupplier fieldValueParser = () -> {
-            XContentParser valueParser = contentType.xContent()
-                .createParser(parser.getXContentRegistry(), parser.getDeprecationHandler(), rawContent);
-            valueParser.nextToken(); // position at the start of the value
-            return valueParser;
-        };
+        final FieldValueParserSupplier fieldValueParser = new FieldValueParserSupplier(
+            contentType,
+            parser.getXContentRegistry(),
+            parser.getDeprecationHandler(),
+            rawContent
+        );
 
         final String resolvedFieldName = resolvedPaths[resolvedPaths.length - 1];
 

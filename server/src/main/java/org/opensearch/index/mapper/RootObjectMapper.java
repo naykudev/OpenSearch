@@ -764,9 +764,9 @@ public class RootObjectMapper extends ObjectMapper {
         // never invoked at index-creation time. Then hand it to the type parser, which validates the
         // content and reports any invalid config.
         try {
-            handler.adjustMappingConfig(fieldTypeConfig, () -> {
-                throw new IllegalStateException("A complete plugin template config must not read the field value");
-            });
+            // No document is available at index creation, so the supplier's get() throws. A complete
+            // config never reads the field value, so this is a no-op normalization (e.g. type injection).
+            handler.adjustMappingConfig(fieldTypeConfig, FieldValueParserSupplier.withoutValue());
         } catch (IllegalStateException | IOException e) {
             // A complete config performs no I/O and must not read the field value. If a handler
             // violates that contract, treat it as non-fatal and defer validation to document-parse time
