@@ -1233,42 +1233,32 @@ final class DocumentParser {
 
         final String resolvedFieldName = resolvedPaths[resolvedPaths.length - 1];
 
-        // Step 1: Check plugin-registered dynamic templates first — explicit user intent beats
-        // auto-inference. A user who writes match_mapping_type: "knn_vector" with dimension: 64
-        // has declared their intent; we must not reject it because it falls below the inferencer
-        // threshold. Template matching is already scoped by the user's match/path_match patterns
-        // on the DynamicTemplate, so it only fires for fields the user intended.
-        for (Map.Entry<String, DynamicTemplateTypeHandler> entry : templateTypes.entrySet()) {
-            Mapper.Builder templateBuilder = findPluginTemplateBuilder(
-                context,
-                resolvedFieldName,
-                entry,
-                dynamic,
-                resolvedParent.fullPath(),
-                fieldValueParser
-            );
-            if (templateBuilder != null) {
-                Mapper.BuilderContext templateBuilderContext = new Mapper.BuilderContext(
-                    context.indexSettings().getSettings(),
-                    context.path()
-                );
-                Mapper templateMapper = templateBuilder.build(templateBuilderContext);
-                context.addDynamicMapper(templateMapper);
-                try (
-                    XContentParser replayParser = contentType.xContent()
-                        .createParser(context.parser().getXContentRegistry(), context.parser().getDeprecationHandler(), rawContent)
-                ) {
-                    replayParser.nextToken();
-                    ParseContext replayContext = context.switchParser(replayParser);
-                    context.path().add(resolvedFieldName);
-                    parseObjectOrField(replayContext, templateMapper);
-                    context.path().remove();
-                }
-                for (int i = 0; i < parentMapperTuple.v1(); i++) {
-                    context.path().remove();
-                }
-                return true;
+        // Step 1: Check dynamic templates with match_mapping_type: "array" first — explicit user
+        // intent beats auto-inference. A user who writes match_mapping_type: "array" with a
+        // mapping of {type: knn_vector, dimension: 64} has declared their intent; we must not
+        // reject it because it falls below the inferencer threshold. Core detects only that the
+        // value is an array; each registered handler decides whether the array is one of its types
+        // and completes the config. Template matching is already scoped by the user's match/path_match
+        // patterns, so it only fires for fields the user intended.
+        Mapper.Builder templateBuilder = findArrayTemplateBuilder(context, resolvedFieldName, templateTypes, fieldValueParser);
+        if (templateBuilder != null) {
+            Mapper.BuilderContext templateBuilderContext = new Mapper.BuilderContext(context.indexSettings().getSettings(), context.path());
+            Mapper templateMapper = templateBuilder.build(templateBuilderContext);
+            context.addDynamicMapper(templateMapper);
+            try (
+                XContentParser replayParser = contentType.xContent()
+                    .createParser(context.parser().getXContentRegistry(), context.parser().getDeprecationHandler(), rawContent)
+            ) {
+                replayParser.nextToken();
+                ParseContext replayContext = context.switchParser(replayParser);
+                context.path().add(resolvedFieldName);
+                parseObjectOrField(replayContext, templateMapper);
+                context.path().remove();
             }
+            for (int i = 0; i < parentMapperTuple.v1(); i++) {
+                context.path().remove();
+            }
+            return true;
         }
 
         // Step 2: No template matched — run the inferencer as the auto-detection fallback.
@@ -2025,54 +2015,71 @@ final class DocumentParser {
     }
 
     /**
-     * Attempts to find a plugin-registered dynamic template whose {@code match_mapping_type} equals
-     * {@code pluginType} and whose path/name patterns match the field being parsed.
+     * Attempts to build a mapper for a dynamic template with {@code match_mapping_type: "array"} whose
+     * path/name patterns match the field being parsed.
      *
-     * <p>If a matching template is found, calls {@link DynamicTemplateTypeHandler#adjustMappingConfig}
-     * with a factory that produces a fresh parser over the buffered field bytes, so the handler can
-     * inject any required parameters (e.g. dimension) before the {@link Mapper.TypeParser} builds the
-     * mapper. This runs before TypeParser so that parameters that can only be inferred from the data
-     * are present when the mapper is constructed. Handlers whose config is already complete never call
-     * {@code get()}, so no parsing happens for fully-specified templates.
+     * <p>Core only knows the value is an array; it offers the matched template to each registered
+     * {@link DynamicTemplateTypeHandler} in registration order via
+     * {@link DynamicTemplateTypeHandler#adjustMappingConfig}, passing a factory that produces a fresh
+     * parser over the buffered field bytes. The first handler to claim the field (return {@code true})
+     * wins: it injects its own {@code type} and any data-derived parameter (e.g. a vector's dimension)
+     * before the {@link Mapper.TypeParser} builds the mapper. This runs before the TypeParser so those
+     * parameters are present when the mapper is constructed. Handlers whose config is already complete
+     * never call {@code get()}, so no parsing happens for fully-specified templates.
+     *
+     * <p>If no handler claims the field, returns {@code null} so the caller falls back to normal
+     * element-wise array parsing.
      *
      * @param name          the simple field name being parsed (last path component)
-     * @param entry         the plugin type string (e.g. {@code "knn_vector"}) and its handler
+     * @param templateTypes the registered handlers keyed by their plugin type string
      * @param fieldValueParser produces a fresh parser over the buffered field bytes
      * @return a {@link Mapper.Builder} ready to build the mapper, or {@code null} if no template matched
+     *         or no handler claimed the field
      */
     @SuppressWarnings("rawtypes")
-    private static Mapper.Builder findPluginTemplateBuilder(
+    private static Mapper.Builder findArrayTemplateBuilder(
         ParseContext context,
         String name,
-        Map.Entry<String, DynamicTemplateTypeHandler> entry,
-        ObjectMapper.Dynamic dynamic,
-        String fieldFullPath,
+        Map<String, DynamicTemplateTypeHandler> templateTypes,
         FieldValueParserSupplier fieldValueParser
     ) throws IOException {
-        String pluginType = entry.getKey();
-        DynamicTemplateTypeHandler handler = entry.getValue();
-        DynamicTemplate dynamicTemplate = findPluginTemplate(context.root(), context.path(), name, pluginType);
+        DynamicTemplate dynamicTemplate = findArrayTemplate(context.root(), context.path(), name);
         if (dynamicTemplate == null) {
             return null;
         }
-        String mappingType = dynamicTemplate.mappingType(pluginType);
         Mapper.TypeParser.ParserContext parserContext = context.docMapperParser().parserContext();
-        Mapper.TypeParser typeParser = parserContext.typeParser(mappingType);
-        if (typeParser == null) {
-            throw new MapperParsingException("failed to find type parsed [" + mappingType + "] for [" + name + "]");
+        // Offer the matched template to each handler; the first to claim the field (inject its type)
+        // wins. A handler that declines leaves the config untouched for the next one.
+        for (DynamicTemplateTypeHandler handler : templateTypes.values()) {
+            Map<String, Object> mappingConfig = dynamicTemplate.mappingForName(name, XContentFieldType.ARRAY.defaultMappingType());
+            if (handler.adjustMappingConfig(mappingConfig, fieldValueParser) == false) {
+                continue;
+            }
+            // The handler injects its own type; resolve the TypeParser from the now-complete config.
+            Object typeNode = mappingConfig.get("type");
+            if (typeNode == null) {
+                continue;
+            }
+            Mapper.TypeParser typeParser = parserContext.typeParser(typeNode.toString());
+            if (typeParser == null) {
+                throw new MapperParsingException("failed to find type parsed [" + typeNode + "] for [" + name + "]");
+            }
+            return typeParser.parse(name, mappingConfig, parserContext);
         }
-        Map<String, Object> mappingConfig = dynamicTemplate.mappingForName(name, pluginType);
-        // The handler completes the config (injects its own type when omitted, and any data-derived
-        // params such as dimension) before the TypeParser builds the mapper.
-        handler.adjustMappingConfig(mappingConfig, fieldValueParser);
-        return typeParser.parse(name, mappingConfig, parserContext);
+        return null;
     }
 
-    /** Scans dynamic templates on the root mapper for one whose {@code match_mapping_type} equals {@code pluginType} and whose path/name patterns match. */
-    private static DynamicTemplate findPluginTemplate(RootObjectMapper root, ContentPath path, String name, String pluginType) {
+    /**
+     * Scans dynamic templates on the root mapper for one that explicitly declares
+     * {@code match_mapping_type: "array"} and whose path/name patterns match. Wildcard and name-only
+     * templates ({@code match_mapping_type} absent) are intentionally excluded so they keep flowing
+     * through the normal element-wise array path rather than being offered to plugin handlers.
+     */
+    private static DynamicTemplate findArrayTemplate(RootObjectMapper root, ContentPath path, String name) {
         final String pathAsString = path.pathAsText(name);
         for (DynamicTemplate dynamicTemplate : root.dynamicTemplates()) {
-            if (dynamicTemplate.matchesPluginType(pathAsString, name, pluginType)) {
+            if (dynamicTemplate.getXContentFieldType() == XContentFieldType.ARRAY
+                && dynamicTemplate.match(pathAsString, name, XContentFieldType.ARRAY)) {
                 return dynamicTemplate;
             }
         }

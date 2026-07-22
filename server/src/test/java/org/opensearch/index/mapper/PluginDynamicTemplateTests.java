@@ -27,11 +27,12 @@ import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 
 /**
- * Tests for plugin-extensible dynamic template types (match_mapping_type SPI)
+ * Tests for plugin-extensible array dynamic templates (match_mapping_type: "array" SPI)
  * and field type inferencers (DynamicFieldTypeInferencer SPI).
  *
  * Uses a minimal stub plugin:
- * - Registers "mock_type" as a plugin match_mapping_type
+ * - Registers two {@link DynamicTemplateTypeHandler}s, each scoped to its own injected mapping type
+ *   ({@code mock_type} = eagerly validated, {@code mock_inferred_type} = data-derived / deferred).
  * - Registers an inferencer that claims numeric scalars >= 100 as "long"
  *   (scalars are safe — Long mapper handles them without parsesArrayValue issues)
  */
@@ -42,24 +43,37 @@ public class PluginDynamicTemplateTests extends MapperServiceTestCase {
     // parameters and therefore cannot be validated at index-creation time.
     private static final String MOCK_INFERRED_TYPE = "mock_inferred_type";
 
-    /** No-op handler — template config used as-is. Reports its config as always complete. */
+    /**
+     * Handler scoped to {@code mock_type}: claims an array template only when its mapping declares
+     * {@code type: mock_type}. Reports its config as statically complete, so it is validated eagerly.
+     */
     static class MockTemplateTypeHandler implements DynamicTemplateTypeHandler {
         @Override
-        public void adjustMappingConfig(Map<String, Object> mappingConfig, FieldValueParserSupplier fieldValueParser) {}
+        public boolean adjustMappingConfig(Map<String, Object> mappingConfig, FieldValueParserSupplier fieldValueParser) {
+            return MOCK_TYPE.equals(mappingConfig.get("type"));
+        }
 
         @Override
         public boolean isConfigComplete(Map<String, Object> mappingConfig) {
-            return true;
+            return MOCK_TYPE.equals(mappingConfig.get("type"));
         }
     }
 
-    /** Handler for a data-derived type: config is never complete, so validation is deferred. */
+    /**
+     * Handler scoped to {@code mock_inferred_type}: claims only its own type and always reads the field
+     * value (data-derived), so its config is never complete and validation is deferred.
+     */
     static class MockInferredTemplateTypeHandler implements DynamicTemplateTypeHandler {
         @Override
-        public void adjustMappingConfig(Map<String, Object> mappingConfig, FieldValueParserSupplier fieldValueParser) throws IOException {
+        public boolean adjustMappingConfig(Map<String, Object> mappingConfig, FieldValueParserSupplier fieldValueParser)
+            throws IOException {
+            if (MOCK_INFERRED_TYPE.equals(mappingConfig.get("type")) == false) {
+                return false;
+            }
             try (XContentParser parser = fieldValueParser.get()) {
                 parser.currentToken();
             }
+            return true;
         }
 
         @Override
@@ -134,90 +148,65 @@ public class PluginDynamicTemplateTests extends MapperServiceTestCase {
     // DynamicTemplate unit tests
     // =====================================================================
 
-    public void testPluginMatchTypeStoredOnParse() {
+    public void testArrayMatchTypeStoredOnParse() {
         Map<String, Object> conf = new HashMap<>();
-        conf.put("match_mapping_type", MOCK_TYPE);
-        conf.put("mapping", Collections.singletonMap("type", "keyword"));
+        conf.put("match_mapping_type", "array");
+        conf.put("mapping", Collections.singletonMap("type", MOCK_TYPE));
         DynamicTemplate template = DynamicTemplate.parse("t", conf);
-        assertEquals(MOCK_TYPE, template.getPluginMatchType());
-        assertNull(template.getXContentFieldType());
+        assertEquals(XContentFieldType.ARRAY, template.getXContentFieldType());
     }
 
-    public void testBuiltinMatchTypeNotStoredAsPlugin() {
-        Map<String, Object> conf = new HashMap<>();
-        conf.put("match_mapping_type", "string");
-        conf.put("mapping", Collections.singletonMap("type", "keyword"));
-        DynamicTemplate template = DynamicTemplate.parse("t", conf);
-        assertNull(template.getPluginMatchType());
-        assertEquals(XContentFieldType.STRING, template.getXContentFieldType());
-    }
-
-    public void testAllBuiltinTypesNotStoredAsPlugin() {
+    public void testAllBuiltinTypesStoredAsXContentFieldType() {
         for (XContentFieldType t : XContentFieldType.values()) {
             Map<String, Object> conf = new HashMap<>();
             conf.put("match_mapping_type", t.toString());
             conf.put("mapping", Collections.singletonMap("type", "keyword"));
             DynamicTemplate template = DynamicTemplate.parse("t_" + t, conf);
-            assertNull("builtin type " + t + " must not be stored as pluginMatchType", template.getPluginMatchType());
             assertEquals(t, template.getXContentFieldType());
         }
     }
 
-    public void testMatchesPluginTypeTrue() {
+    public void testArrayTemplateMatchesByType() {
         Map<String, Object> conf = new HashMap<>();
-        conf.put("match_mapping_type", MOCK_TYPE);
+        conf.put("match_mapping_type", "array");
+        conf.put("mapping", Collections.singletonMap("type", MOCK_TYPE));
+        DynamicTemplate template = DynamicTemplate.parse("t", conf);
+        assertTrue(template.match("field", "field", XContentFieldType.ARRAY));
+        assertFalse(template.match("field", "field", XContentFieldType.STRING));
+    }
+
+    public void testArrayTemplateMatchesByName() {
+        Map<String, Object> conf = new HashMap<>();
+        conf.put("match_mapping_type", "array");
         conf.put("match", "big_*");
-        conf.put("mapping", Collections.singletonMap("type", "keyword"));
+        conf.put("mapping", Collections.singletonMap("type", MOCK_TYPE));
         DynamicTemplate template = DynamicTemplate.parse("t", conf);
-        assertTrue(template.matchesPluginType("big_field", "big_field", MOCK_TYPE));
+        assertTrue(template.match("big_field", "big_field", XContentFieldType.ARRAY));
+        assertFalse(template.match("small_field", "small_field", XContentFieldType.ARRAY));
     }
 
-    public void testMatchesPluginTypeFalseWrongType() {
+    public void testArrayTemplateMatchesByPathAndUnmatch() {
         Map<String, Object> conf = new HashMap<>();
-        conf.put("match_mapping_type", MOCK_TYPE);
-        conf.put("mapping", Collections.singletonMap("type", "keyword"));
-        DynamicTemplate template = DynamicTemplate.parse("t", conf);
-        assertFalse(template.matchesPluginType("field", "field", "other_type"));
-    }
-
-    public void testMatchesPluginTypeFalseNamePatternMismatch() {
-        Map<String, Object> conf = new HashMap<>();
-        conf.put("match_mapping_type", MOCK_TYPE);
-        conf.put("match", "big_*");
-        conf.put("mapping", Collections.singletonMap("type", "keyword"));
-        DynamicTemplate template = DynamicTemplate.parse("t", conf);
-        assertFalse(template.matchesPluginType("small_field", "small_field", MOCK_TYPE));
-    }
-
-    public void testMatchesPluginTypeWithPathMatch() {
-        Map<String, Object> conf = new HashMap<>();
-        conf.put("match_mapping_type", MOCK_TYPE);
+        conf.put("match_mapping_type", "array");
         conf.put("path_match", "obj.*");
-        conf.put("mapping", Collections.singletonMap("type", "keyword"));
-        DynamicTemplate template = DynamicTemplate.parse("t", conf);
-        assertTrue(template.matchesPluginType("obj.field", "field", MOCK_TYPE));
-        assertFalse(template.matchesPluginType("other.field", "field", MOCK_TYPE));
-    }
-
-    public void testMatchesPluginTypeWithUnmatch() {
-        Map<String, Object> conf = new HashMap<>();
-        conf.put("match_mapping_type", MOCK_TYPE);
         conf.put("unmatch", "excluded_*");
-        conf.put("mapping", Collections.singletonMap("type", "keyword"));
+        conf.put("mapping", Collections.singletonMap("type", MOCK_TYPE));
         DynamicTemplate template = DynamicTemplate.parse("t", conf);
-        assertTrue(template.matchesPluginType("big_field", "big_field", MOCK_TYPE));
-        assertFalse(template.matchesPluginType("excluded_field", "excluded_field", MOCK_TYPE));
+        assertTrue(template.match("obj.field", "field", XContentFieldType.ARRAY));
+        assertFalse(template.match("other.field", "field", XContentFieldType.ARRAY));
+        assertFalse(template.match("obj.excluded_x", "excluded_x", XContentFieldType.ARRAY));
     }
 
-    public void testBuiltinMatchNeverReturnsPluginTemplate() throws IOException {
-        // findTemplate() on RootObjectMapper must skip plugin templates
+    public void testFindTemplateNeverReturnsArrayTemplate() throws IOException {
+        // findTemplate() on RootObjectMapper must skip array templates — they are handled by the plugin hook.
         MapperService mapperService = createMapperService(topMapping(b -> {
             b.startArray("dynamic_templates");
             b.startObject();
             b.startObject("mock_template");
-            b.field("match_mapping_type", MOCK_TYPE);
+            b.field("match_mapping_type", "array");
             b.startObject("mapping");
-            b.field("type", "keyword");
+            b.field("type", MOCK_TYPE);
+            b.field("required_param", "present");
             b.endObject();
             b.endObject();
             b.endObject();
@@ -226,26 +215,25 @@ public class PluginDynamicTemplateTests extends MapperServiceTestCase {
         RootObjectMapper root = mapperService.documentMapper().mapping().root();
         ContentPath path = new ContentPath();
         for (XContentFieldType t : XContentFieldType.values()) {
-            assertNull("findTemplate must not return plugin template for builtin type " + t, root.findTemplate(path, "any_field", t));
+            assertNull("findTemplate must not return array template for type " + t, root.findTemplate(path, "any_field", t));
         }
     }
 
-    public void testPluginTemplateSerializesMatchMappingType() throws Exception {
+    public void testArrayTemplateSerializesMatchMappingType() throws Exception {
         Map<String, Object> conf = new HashMap<>();
-        conf.put("match_mapping_type", MOCK_TYPE);
-        conf.put("mapping", Collections.singletonMap("type", "keyword"));
+        conf.put("match_mapping_type", "array");
+        conf.put("mapping", Collections.singletonMap("type", MOCK_TYPE));
         DynamicTemplate template = DynamicTemplate.parse("t", conf);
         XContentBuilder builder = JsonXContent.contentBuilder();
         template.toXContent(builder, ToXContent.EMPTY_PARAMS);
-        assertThat(builder.toString(), containsString("\"match_mapping_type\":\"" + MOCK_TYPE + "\""));
+        assertThat(builder.toString(), containsString("\"match_mapping_type\":\"array\""));
     }
 
-    public void testWildcardNotStoredAsPlugin() {
+    public void testWildcardHasNoXContentFieldType() {
         Map<String, Object> conf = new HashMap<>();
         conf.put("match_mapping_type", "*");
         conf.put("mapping", Collections.singletonMap("type", "keyword"));
         DynamicTemplate template = DynamicTemplate.parse("t", conf);
-        assertNull(template.getPluginMatchType());
         assertNull(template.getXContentFieldType());
     }
 
@@ -253,7 +241,7 @@ public class PluginDynamicTemplateTests extends MapperServiceTestCase {
     // Index creation validation tests
     // =====================================================================
 
-    public void testUnregisteredPluginTypeThrowsAtIndexCreation() throws IOException {
+    public void testUnknownMatchTypeThrowsAtIndexCreation() throws IOException {
         XContentBuilder mapping = topMapping(b -> {
             b.startArray("dynamic_templates");
             b.startObject();
@@ -268,37 +256,18 @@ public class PluginDynamicTemplateTests extends MapperServiceTestCase {
         });
         MapperParsingException e = expectThrows(MapperParsingException.class, () -> createMapperService(mapping));
         assertThat(e.getMessage(), containsString("No field type matched on [unregistered_type]"));
-        assertThat(e.getMessage(), containsString(MOCK_TYPE));
-        assertThat(e.getMessage(), containsString("string"));
-        assertThat(e.getMessage(), containsString("long"));
+        assertThat(e.getMessage(), containsString("array"));
     }
 
-    public void testTypoInPluginTypeThrowsWithFullList() throws IOException {
-        XContentBuilder mapping = topMapping(b -> {
-            b.startArray("dynamic_templates");
-            b.startObject();
-            b.startObject("typo_template");
-            b.field("match_mapping_type", "mock_typo");
-            b.startObject("mapping");
-            b.field("type", "keyword");
-            b.endObject();
-            b.endObject();
-            b.endObject();
-            b.endArray();
-        });
-        MapperParsingException e = expectThrows(MapperParsingException.class, () -> createMapperService(mapping));
-        assertThat(e.getMessage(), containsString("mock_typo"));
-        assertThat(e.getMessage(), containsString(MOCK_TYPE));
-    }
-
-    public void testRegisteredPluginTypeAcceptedAtIndexCreation() throws IOException {
+    public void testArrayMatchTypeAcceptedAtIndexCreation() throws IOException {
         createMapperService(topMapping(b -> {
             b.startArray("dynamic_templates");
             b.startObject();
             b.startObject("mock_template");
-            b.field("match_mapping_type", MOCK_TYPE);
+            b.field("match_mapping_type", "array");
             b.startObject("mapping");
-            b.field("type", "keyword");
+            b.field("type", MOCK_TYPE);
+            b.field("required_param", "present");
             b.endObject();
             b.endObject();
             b.endObject();
@@ -306,7 +275,7 @@ public class PluginDynamicTemplateTests extends MapperServiceTestCase {
         }));
     }
 
-    public void testBuiltinTypeStillWorksAlongsidePluginType() throws IOException {
+    public void testBuiltinTypeStillWorksAlongsideArrayType() throws IOException {
         createMapperService(topMapping(b -> {
             b.startArray("dynamic_templates");
             b.startObject();
@@ -319,27 +288,7 @@ public class PluginDynamicTemplateTests extends MapperServiceTestCase {
             b.endObject();
             b.startObject();
             b.startObject("mock_template");
-            b.field("match_mapping_type", MOCK_TYPE);
-            b.startObject("mapping");
-            b.field("type", "keyword");
-            b.endObject();
-            b.endObject();
-            b.endObject();
-            b.endArray();
-        }));
-    }
-
-    // =====================================================================
-    // Eager plugin-template validation at index creation
-    // =====================================================================
-
-    public void testCompletePluginTemplateWithValidConfigAccepted() throws IOException {
-        // Handler opens no parser (complete config) and the type parser is satisfied → index creation succeeds.
-        createMapperService(topMapping(b -> {
-            b.startArray("dynamic_templates");
-            b.startObject();
-            b.startObject("mock_template");
-            b.field("match_mapping_type", MOCK_TYPE);
+            b.field("match_mapping_type", "array");
             b.startObject("mapping");
             b.field("type", MOCK_TYPE);
             b.field("required_param", "present");
@@ -350,14 +299,35 @@ public class PluginDynamicTemplateTests extends MapperServiceTestCase {
         }));
     }
 
-    public void testCompletePluginTemplateWithInvalidConfigThrowsAtIndexCreation() throws IOException {
+    // =====================================================================
+    // Eager array-template validation at index creation
+    // =====================================================================
+
+    public void testCompleteArrayTemplateWithValidConfigAccepted() throws IOException {
+        // Handler opens no parser (complete config) and the type parser is satisfied → index creation succeeds.
+        createMapperService(topMapping(b -> {
+            b.startArray("dynamic_templates");
+            b.startObject();
+            b.startObject("mock_template");
+            b.field("match_mapping_type", "array");
+            b.startObject("mapping");
+            b.field("type", MOCK_TYPE);
+            b.field("required_param", "present");
+            b.endObject();
+            b.endObject();
+            b.endObject();
+            b.endArray();
+        }));
+    }
+
+    public void testCompleteArrayTemplateWithInvalidConfigThrowsAtIndexCreation() throws IOException {
         // Complete config (handler opens no parser) but required_param is missing → the type parser
         // throws at index creation instead of silently accepting the broken template.
         XContentBuilder mapping = topMapping(b -> {
             b.startArray("dynamic_templates");
             b.startObject();
             b.startObject("mock_template");
-            b.field("match_mapping_type", MOCK_TYPE);
+            b.field("match_mapping_type", "array");
             b.startObject("mapping");
             b.field("type", MOCK_TYPE);
             b.endObject();
@@ -369,14 +339,14 @@ public class PluginDynamicTemplateTests extends MapperServiceTestCase {
         assertThat(e.getMessage(), containsString("required_param missing"));
     }
 
-    public void testInferredPluginTemplateWithIncompleteConfigNotValidatedAtIndexCreation() throws IOException {
+    public void testInferredArrayTemplateWithIncompleteConfigNotValidatedAtIndexCreation() throws IOException {
         // The handler for this type always opens the parser (data-derived config), so even though
         // required_param is absent the template must NOT be validated/rejected at index creation.
         createMapperService(topMapping(b -> {
             b.startArray("dynamic_templates");
             b.startObject();
             b.startObject("inferred_template");
-            b.field("match_mapping_type", MOCK_INFERRED_TYPE);
+            b.field("match_mapping_type", "array");
             b.startObject("mapping");
             b.field("type", MOCK_INFERRED_TYPE);
             b.endObject();
@@ -386,13 +356,13 @@ public class PluginDynamicTemplateTests extends MapperServiceTestCase {
         }));
     }
 
-    public void testPluginTemplateWithNamePlaceholderSkipsEagerValidation() throws IOException {
+    public void testArrayTemplateWithNamePlaceholderSkipsEagerValidation() throws IOException {
         // {name} can't be resolved up front, so validation is skipped even though required_param is missing.
         createMapperService(topMapping(b -> {
             b.startArray("dynamic_templates");
             b.startObject();
             b.startObject("named_template");
-            b.field("match_mapping_type", MOCK_TYPE);
+            b.field("match_mapping_type", "array");
             b.startObject("mapping");
             b.field("type", MOCK_TYPE);
             b.field("field_name", "{name}");
@@ -534,9 +504,10 @@ public class PluginDynamicTemplateTests extends MapperServiceTestCase {
             b.startArray("dynamic_templates");
             b.startObject();
             b.startObject("mock_template");
-            b.field("match_mapping_type", MOCK_TYPE);
+            b.field("match_mapping_type", "array");
             b.startObject("mapping");
-            b.field("type", "keyword");
+            b.field("type", MOCK_TYPE);
+            b.field("required_param", "present");
             b.endObject();
             b.endObject();
             b.endObject();

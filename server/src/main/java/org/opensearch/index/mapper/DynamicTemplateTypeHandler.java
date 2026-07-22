@@ -15,9 +15,9 @@ import java.io.IOException;
 import java.util.Map;
 
 /**
- * Handler for plugin-registered dynamic template types.
- * Called when a dynamic template matches on a plugin-registered type string
- * (e.g. "knn_vector") to allow the plugin to adjust the mapping configuration
+ * Handler for a plugin type behind a dynamic template with {@code match_mapping_type: "array"}.
+ * Core detects only that an unmapped field's value is an array; each registered handler decides
+ * whether the array is actually one of its types and, if so, completes the mapping configuration
  * before the mapper is built.
  *
  * <p>Rather than deserializing the field value for the handler, core hands it a
@@ -33,17 +33,25 @@ import java.util.Map;
 public interface DynamicTemplateTypeHandler {
 
     /**
-     * Adjust the mapping configuration before the TypeParser builds the mapper.
-     * Called when a dynamic template matches but before the mapper is constructed.
+     * Given a matched {@code match_mapping_type: "array"} template, decide whether this handler
+     * claims the field and, if so, complete the mapping configuration before the TypeParser builds
+     * the mapper. Called at the single convergence point in document parsing where the field name,
+     * value, and parser position are all known.
+     *
+     * <p>Returning {@code false} declines the field: core offers it to the next registered handler
+     * and, if none claim it, falls back to the normal element-wise array parsing. A handler that
+     * claims the field must inject its own {@code type} (and any data-derived parameter such as a
+     * vector's dimension) into {@code mappingConfig}.
      *
      * @param mappingConfig the mutable mapping config from the template (modified in place)
      * @param fieldValueParser produces a fresh {@link XContentParser} over the buffered field bytes;
      *                      only call {@code get()} if the config is missing a parameter that must
      *                      be derived from the data. Close the returned parser (e.g. via
      *                      try-with-resources).
+     * @return {@code true} if this handler claims the field, {@code false} to decline it
      * @throws IOException if reading from the parser fails
      */
-    void adjustMappingConfig(Map<String, Object> mappingConfig, FieldValueParserSupplier fieldValueParser) throws IOException;
+    boolean adjustMappingConfig(Map<String, Object> mappingConfig, FieldValueParserSupplier fieldValueParser) throws IOException;
 
     /**
      * Returns {@code true} if the given template mapping config is fully specified — i.e. building a

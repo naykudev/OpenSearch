@@ -178,6 +178,20 @@ public class DynamicTemplate implements ToXContentObject {
             public String toString() {
                 return "binary";
             }
+        },
+        ARRAY {
+            @Override
+            public String defaultMappingType() {
+                // Core has no array mapper: an "array" template only matches when a registered plugin
+                // handler claims the field (see DynamicTemplateTypeHandler). The concrete type is injected
+                // by that handler, so this default is never used to build a mapper on its own.
+                return "array";
+            }
+
+            @Override
+            public String toString() {
+                return "array";
+            }
         };
 
         public static XContentFieldType fromString(String value) {
@@ -195,18 +209,11 @@ public class DynamicTemplate implements ToXContentObject {
         public abstract String defaultMappingType();
     }
 
-    /** Parses a dynamic template without plugin-type validation: any unknown match_mapping_type is kept as a plugin match type. */
-    public static DynamicTemplate parse(String name, Map<String, Object> conf) throws MapperParsingException {
-        return parse(name, conf, null);
-    }
-
     /**
-     * Parses a dynamic template. If {@code knownPluginTypes} is non-null, a {@code match_mapping_type}
-     * that is neither an {@link XContentFieldType} nor a registered plugin type fails here, before any
-     * {@link DynamicTemplate} is constructed.
+     * Parses a dynamic template. A {@code match_mapping_type} that is neither {@code *} nor a known
+     * {@link XContentFieldType} fails here, before any {@link DynamicTemplate} is constructed.
      */
-    static DynamicTemplate parse(String name, Map<String, Object> conf, Map<String, DynamicTemplateTypeHandler> knownPluginTypes)
-        throws MapperParsingException {
+    public static DynamicTemplate parse(String name, Map<String, Object> conf) throws MapperParsingException {
         String match = null;
         String pathMatch = null;
         String unmatch = null;
@@ -246,28 +253,9 @@ public class DynamicTemplate implements ToXContentObject {
         }
 
         XContentFieldType xcontentFieldType = null;
-        String pluginMatchType = null;
         if (matchMappingType != null && !matchMappingType.equals("*")) {
-            for (XContentFieldType t : XContentFieldType.values()) {
-                if (t.toString().equals(matchMappingType)) {
-                    xcontentFieldType = t;
-                    break;
-                }
-            }
-            if (xcontentFieldType == null) {
-                pluginMatchType = matchMappingType;
-                // Validate plugin type before constructing the template
-                if (knownPluginTypes != null && !knownPluginTypes.containsKey(pluginMatchType)) {
-                    List<String> allTypes = new ArrayList<>();
-                    for (XContentFieldType t : XContentFieldType.values()) {
-                        allTypes.add(t.toString());
-                    }
-                    allTypes.addAll(knownPluginTypes.keySet());
-                    throw new IllegalArgumentException(
-                        "No field type matched on [" + pluginMatchType + "], possible values are " + allTypes
-                    );
-                }
-            }
+            // Fails with the full list of valid types if match_mapping_type is not a known XContentFieldType.
+            xcontentFieldType = XContentFieldType.fromString(matchMappingType);
         }
 
         final MatchType matchType = MatchType.fromString(matchPattern);
@@ -287,7 +275,7 @@ public class DynamicTemplate implements ToXContentObject {
             }
         }
 
-        return new DynamicTemplate(name, pathMatch, pathUnmatch, match, unmatch, xcontentFieldType, pluginMatchType, matchType, mapping);
+        return new DynamicTemplate(name, pathMatch, pathUnmatch, match, unmatch, xcontentFieldType, matchType, mapping);
     }
 
     private final String name;
@@ -304,8 +292,6 @@ public class DynamicTemplate implements ToXContentObject {
 
     private final XContentFieldType xcontentFieldType;
 
-    private final String pluginMatchType;
-
     private final Map<String, Object> mapping;
 
     private DynamicTemplate(
@@ -315,7 +301,6 @@ public class DynamicTemplate implements ToXContentObject {
         String match,
         String unmatch,
         XContentFieldType xcontentFieldType,
-        String pluginMatchType,
         MatchType matchType,
         Map<String, Object> mapping
     ) {
@@ -326,7 +311,6 @@ public class DynamicTemplate implements ToXContentObject {
         this.unmatch = unmatch;
         this.matchType = matchType;
         this.xcontentFieldType = xcontentFieldType;
-        this.pluginMatchType = pluginMatchType;
         this.mapping = mapping;
     }
 
@@ -350,12 +334,6 @@ public class DynamicTemplate implements ToXContentObject {
         if (!matchesPathAndName(path, name)) return false;
         if (this.xcontentFieldType != null && this.xcontentFieldType != xcontentFieldType) return false;
         return true;
-    }
-
-    /** Returns true if this template's {@code match_mapping_type} equals {@code pluginType} and the path/name patterns match. */
-    public boolean matchesPluginType(String path, String name, String pluginType) {
-        if (this.pluginMatchType == null || !this.pluginMatchType.equals(pluginType)) return false;
-        return matchesPathAndName(path, name);
     }
 
     public String mappingType(String dynamicType) {
@@ -437,11 +415,6 @@ public class DynamicTemplate implements ToXContentObject {
         return xcontentFieldType;
     }
 
-    /** Returns the plugin-registered match_mapping_type string, or null if this is a standard template. */
-    public String getPluginMatchType() {
-        return pluginMatchType;
-    }
-
     Map<String, Object> getMapping() {
         return mapping;
     }
@@ -463,8 +436,6 @@ public class DynamicTemplate implements ToXContentObject {
         }
         if (xcontentFieldType != null) {
             builder.field("match_mapping_type", xcontentFieldType);
-        } else if (pluginMatchType != null) {
-            builder.field("match_mapping_type", pluginMatchType);
         } else if (match == null && pathMatch == null) {
             builder.field("match_mapping_type", "*");
         }
