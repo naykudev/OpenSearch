@@ -1272,12 +1272,14 @@ final class DocumentParser {
         }
 
         // Step 2: No template matched — run the inferencer as the auto-detection fallback.
-        // This is the path for fields with no user-defined template: the inferencer checks
-        // whether the field looks like a plugin-managed type (e.g. numeric array >= 128 elements).
+        // This is the path for fields with no user-defined template. Core classifies the buffered
+        // value once (the array analog of scalar token detection) and hands that summary to each
+        // inferencer, so a plugin can dispatch on shape without re-streaming the bytes.
+        final DynamicValueSummary summary = classifyBufferedValue(contentType, parser, rawContent);
         Map<String, Object> inferredFieldMapping = null;
         for (DynamicFieldTypeInferencer inferencer : inferencers) {
             try {
-                inferredFieldMapping = inferencer.inferFieldType(fieldValueParser);
+                inferredFieldMapping = inferencer.inferFieldType(summary, fieldValueParser);
             } catch (Exception e) {
                 // A buggy inferencer must not break document parsing
                 continue;
@@ -1329,6 +1331,37 @@ final class DocumentParser {
             context.path().remove();
         }
         return true;
+    }
+
+    /**
+     * Classifies the buffered field value into a generic {@link DynamicValueSummary} — the array analog
+     * of core's scalar token detection. One cheap pass over the buffered bytes states a JSON fact
+     * (flat numeric array of length N, non-numeric array, object, or scalar) so inferencers can dispatch
+     * on shape without re-streaming. Core never interprets the shape as a plugin type.
+     */
+    private static DynamicValueSummary classifyBufferedValue(MediaType contentType, XContentParser originalParser, byte[] rawContent)
+        throws IOException {
+        try (
+            XContentParser parser = contentType.xContent()
+                .createParser(originalParser.getXContentRegistry(), originalParser.getDeprecationHandler(), rawContent)
+        ) {
+            XContentParser.Token token = parser.nextToken();
+            if (token == XContentParser.Token.START_OBJECT) {
+                return DynamicValueSummary.object();
+            }
+            if (token != XContentParser.Token.START_ARRAY) {
+                return DynamicValueSummary.scalar();
+            }
+            int count = 0;
+            boolean flatNumeric = true;
+            while ((token = parser.nextToken()) != XContentParser.Token.END_ARRAY) {
+                if (token != XContentParser.Token.VALUE_NUMBER) {
+                    flatNumeric = false;
+                }
+                count++;
+            }
+            return flatNumeric ? DynamicValueSummary.flatNumericArray(count) : DynamicValueSummary.nonNumericArray(count);
+        }
     }
 
     /**

@@ -74,7 +74,8 @@ public class PluginDynamicTemplateTests extends MapperServiceTestCase {
      */
     static class MockInferencer implements DynamicFieldTypeInferencer {
         @Override
-        public Map<String, Object> inferFieldType(FieldValueParserSupplier fieldValueParser) throws IOException {
+        public Map<String, Object> inferFieldType(DynamicValueSummary summary, FieldValueParserSupplier fieldValueParser)
+            throws IOException {
             try (XContentParser parser = fieldValueParser.get()) {
                 if (parser.currentToken() != XContentParser.Token.VALUE_NUMBER) return null;
                 if (parser.doubleValue() < 100) return null;
