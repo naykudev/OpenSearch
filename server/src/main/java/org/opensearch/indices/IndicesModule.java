@@ -123,11 +123,34 @@ public class IndicesModule extends AbstractModule {
         registerBuiltinWritables();
     }
 
-    /** Collects dynamic field type inferencers from all mapper plugins in registration order. */
+    /**
+     * Collects dynamic field type inferencers from all mapper plugins in registration order, and
+     * rejects the node at startup if two inferencers reserve the same value shape (exclusive ownership
+     * conflict — a reserved shape may be owned by at most one inferencer).
+     */
     private static List<DynamicFieldTypeInferencer> getDynamicFieldTypeInferencers(List<MapperPlugin> mapperPlugins) {
         List<DynamicFieldTypeInferencer> inferencers = new ArrayList<>();
+        Map<org.opensearch.index.mapper.DynamicValueSummary.ValueShape, DynamicFieldTypeInferencer> reservedBy = new java.util.EnumMap<>(
+            org.opensearch.index.mapper.DynamicValueSummary.ValueShape.class
+        );
         for (MapperPlugin mapperPlugin : mapperPlugins) {
-            inferencers.addAll(mapperPlugin.getDynamicFieldTypeInferencers());
+            for (DynamicFieldTypeInferencer inferencer : mapperPlugin.getDynamicFieldTypeInferencers()) {
+                for (org.opensearch.index.mapper.DynamicValueSummary.ValueShape shape : inferencer.reservedShapes()) {
+                    DynamicFieldTypeInferencer existing = reservedBy.putIfAbsent(shape, inferencer);
+                    if (existing != null) {
+                        throw new IllegalArgumentException(
+                            "dynamic value shape ["
+                                + shape
+                                + "] is reserved by more than one inferencer: ["
+                                + existing.getClass().getName()
+                                + "] and ["
+                                + inferencer.getClass().getName()
+                                + "]"
+                        );
+                    }
+                }
+                inferencers.add(inferencer);
+            }
         }
         return inferencers;
     }

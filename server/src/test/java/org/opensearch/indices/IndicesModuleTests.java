@@ -290,4 +290,64 @@ public class IndicesModuleTests extends OpenSearchTestCase {
         assertNotSame(MapperPlugin.NOOP_FIELD_PREDICATE, fieldFilter.apply("hidden_index"));
         assertNotSame(MapperPlugin.NOOP_FIELD_PREDICATE, fieldFilter.apply("filtered"));
     }
+
+    /** An inferencer that reserves a fixed set of value shapes and never claims anything. */
+    private static org.opensearch.index.mapper.DynamicFieldTypeInferencer reservingInferencer(
+        org.opensearch.index.mapper.DynamicValueSummary.ValueShape... shapes
+    ) {
+        return new org.opensearch.index.mapper.DynamicFieldTypeInferencer() {
+            @Override
+            public Map<String, Object> inferFieldType(
+                org.opensearch.index.mapper.DynamicValueSummary summary,
+                org.opensearch.index.mapper.FieldValueParserSupplier fieldValueParser
+            ) {
+                return null;
+            }
+
+            @Override
+            public Set<org.opensearch.index.mapper.DynamicValueSummary.ValueShape> reservedShapes() {
+                return Set.of(shapes);
+            }
+        };
+    }
+
+    public void testTwoPluginsReservingSameShapeRejectedAtStartup() {
+        org.opensearch.index.mapper.DynamicValueSummary.ValueShape shape =
+            org.opensearch.index.mapper.DynamicValueSummary.ValueShape.FLAT_NUMERIC_ARRAY;
+        List<MapperPlugin> plugins = Arrays.asList(new MapperPlugin() {
+            @Override
+            public List<org.opensearch.index.mapper.DynamicFieldTypeInferencer> getDynamicFieldTypeInferencers() {
+                return Collections.singletonList(reservingInferencer(shape));
+            }
+        }, new MapperPlugin() {
+            @Override
+            public List<org.opensearch.index.mapper.DynamicFieldTypeInferencer> getDynamicFieldTypeInferencers() {
+                return Collections.singletonList(reservingInferencer(shape));
+            }
+        });
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> new IndicesModule(plugins));
+        assertThat(e.getMessage(), containsString("reserved by more than one inferencer"));
+        assertThat(e.getMessage(), containsString("FLAT_NUMERIC_ARRAY"));
+    }
+
+    public void testDisjointReservationsAllowed() {
+        List<MapperPlugin> plugins = Arrays.asList(new MapperPlugin() {
+            @Override
+            public List<org.opensearch.index.mapper.DynamicFieldTypeInferencer> getDynamicFieldTypeInferencers() {
+                return Collections.singletonList(
+                    reservingInferencer(org.opensearch.index.mapper.DynamicValueSummary.ValueShape.FLAT_NUMERIC_ARRAY)
+                );
+            }
+        }, new MapperPlugin() {
+            @Override
+            public List<org.opensearch.index.mapper.DynamicFieldTypeInferencer> getDynamicFieldTypeInferencers() {
+                return Collections.singletonList(
+                    reservingInferencer(org.opensearch.index.mapper.DynamicValueSummary.ValueShape.OBJECT)
+                );
+            }
+        });
+        // Different shapes → no conflict → node starts, both inferencers registered.
+        IndicesModule module = new IndicesModule(plugins);
+        assertEquals(2, module.getMapperRegistry().getDynamicFieldTypeInferencers().size());
+    }
 }

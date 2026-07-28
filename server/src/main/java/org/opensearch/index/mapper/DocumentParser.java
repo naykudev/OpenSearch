@@ -1278,6 +1278,13 @@ final class DocumentParser {
         final DynamicValueSummary summary = classifyBufferedValue(contentType, parser, rawContent);
         Map<String, Object> inferredFieldMapping = null;
         for (DynamicFieldTypeInferencer inferencer : inferencers) {
+            // Shape reservation: if this value's shape is exclusively reserved, only the reserving
+            // inferencer may be offered it. Any other inferencer is skipped for this value, so a
+            // reserved shape can never be claimed by a different plugin. If the reserving inferencer
+            // declines, the value falls through to core's built-in handling — never to another plugin.
+            if (isShapeReservedByOther(summary.shape(), inferencer, inferencers)) {
+                continue;
+            }
             try {
                 inferredFieldMapping = inferencer.inferFieldType(summary, fieldValueParser);
             } catch (Exception e) {
@@ -1362,6 +1369,24 @@ final class DocumentParser {
             }
             return flatNumeric ? DynamicValueSummary.flatNumericArray(count) : DynamicValueSummary.nonNumericArray(count);
         }
+    }
+
+    /**
+     * Returns true if {@code shape} is reserved by some inferencer other than {@code candidate}. A
+     * reserved shape is owned exclusively by its reserving inferencer, so no other inferencer may be
+     * offered a value of that shape (see {@link DynamicFieldTypeInferencer#reservedShapes()}).
+     */
+    private static boolean isShapeReservedByOther(
+        DynamicValueSummary.ValueShape shape,
+        DynamicFieldTypeInferencer candidate,
+        List<DynamicFieldTypeInferencer> inferencers
+    ) {
+        for (DynamicFieldTypeInferencer other : inferencers) {
+            if (other != candidate && other.reservedShapes().contains(shape)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

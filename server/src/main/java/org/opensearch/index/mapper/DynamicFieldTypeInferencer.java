@@ -12,7 +12,9 @@ import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.core.xcontent.XContentParser;
 
 import java.io.IOException;
+import java.util.Collections;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * SPI for plugins to register dynamic field type inference logic.
@@ -52,4 +54,23 @@ public interface DynamicFieldTypeInferencer {
      * @throws IOException if reading from the parser fails
      */
     Map<String, Object> inferFieldType(DynamicValueSummary summary, FieldValueParserSupplier fieldValueParser) throws IOException;
+
+    /**
+     * Value shapes this inferencer <em>exclusively reserves</em>. A reserved shape is owned by this
+     * inferencer alone: core will offer a value of that shape only to this inferencer, never to any
+     * other plugin's inferencer. If the reserving inferencer declines (returns {@code null}, e.g. the
+     * value is below its own threshold), the value falls through to core's built-in handling — it is
+     * never handed to a different plugin.
+     *
+     * <p>Two plugins reserving the same shape is a misconfiguration: core rejects it at node startup.
+     *
+     * <p>Reservation does <b>not</b> claim the shape away from core defaults or explicit user mappings;
+     * it only excludes <em>other plugins</em>. Returning an empty set (the default) means this inferencer
+     * competes for values on a first-non-null basis with no exclusivity.
+     *
+     * @return the shapes exclusively owned by this inferencer; empty if none
+     */
+    default Set<DynamicValueSummary.ValueShape> reservedShapes() {
+        return Collections.emptySet();
+    }
 }
